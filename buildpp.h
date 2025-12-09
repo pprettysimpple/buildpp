@@ -61,7 +61,7 @@ using Dir = std::filesystem::path;
 struct Step {
     struct Options {
         std::string name;
-        std::string description;
+        std::string desc;
         bool phony{false};
         bool silent{false};
     } opts;
@@ -180,36 +180,36 @@ public:
     std::vector<std::string> cli_args;
 
     Build(Dir root, Dir cache, Dir out) : root(root), cache(cache), out(out), options(old_options.begin(), old_options.end()) {
-        steps.push_back(Step{.opts = {.name = "install", .description = "Install targets", .silent = false}, .idx = steps.size()});
+        steps.push_back(Step{.opts = {.name = "install", .desc = "Install targets", .silent = false}, .idx = steps.size()});
         install_step = &steps.back();
         
-        steps.push_back(Step{.opts = {.name = "build", .description = "Build all targets", .silent = false}, .idx = steps.size()});
+        steps.push_back(Step{.opts = {.name = "build", .desc = "Build all targets", .silent = false}, .idx = steps.size()});
         build_all_step = &steps.back();
         build_all_step->dependOn(install_step);
         
-        steps.push_back(Step{.opts = {.name = "list", .description = "List available steps", .silent = false}, .idx = steps.size()});
+        steps.push_back(Step{.opts = {.name = "list", .desc = "List available steps", .silent = false}, .idx = steps.size()});
         steps.back().action = [this](std::filesystem::path /*phony*/) {
             printf("Available steps:\n");
             for (const auto& step : steps) {
-                if (!step.opts.silent) printf("- %s: %s\n", step.opts.name.c_str(), step.opts.description.c_str());
+                if (!step.opts.silent) printf("- %s: %s\n", step.opts.name.c_str(), step.opts.desc.c_str());
             }
         };
         
-        steps.push_back(Step{.opts = {.name = "help", .description = "Show help message", .silent = false}, .idx = steps.size()});
+        steps.push_back(Step{.opts = {.name = "help", .desc = "Show help message", .silent = false}, .idx = steps.size()});
         steps.back().action = [this](std::filesystem::path /*phony*/) {
             printf("Build tool help:\n");
             printf("Usage: %s [options] [steps] [-- run-args]\n", saved_argv[0]);
             printf("Options:\n");
             for (const auto& opt : options) {
-                printf("  -D%s : %s\n", opt.key.c_str(), opt.description.c_str());
+                printf("  -D%s :: %s\n", opt.key.c_str(), opt.description.c_str());
             }
             printf("Steps:\n");
             for (const auto& step : steps) {
-                if (!step.opts.silent) printf("  %s : %s\n", step.opts.name.c_str(), step.opts.description.c_str());
+                if (!step.opts.silent) printf("  %s :: %s\n", step.opts.name.c_str(), step.opts.desc.c_str());
             }
             printf("Executables:\n");
             for (const auto& run : runs) {
-                printf("  run-%s : Run exe %s\n", run.target->opts.name.c_str(), run.target->opts.name.c_str());
+                printf("  run-%s :: Run exe %s\n", run.target->opts.name.c_str(), run.target->opts.name.c_str());
             }
         };
     }
@@ -287,7 +287,7 @@ public:
     }
 
     Target* addTarget(Target::Options opts) {
-        steps.push_back(Step{.opts = {.name = "build-" + opts.name, .description = opts.desc, .silent = false}, .idx = steps.size()});
+        steps.push_back(Step{.opts = {.name = "build-" + opts.name, .desc = opts.desc, .silent = false}, .idx = steps.size()});
         targets.push_back(Target{
             .opts = opts,
             .step = &steps.back(),
@@ -336,7 +336,7 @@ public:
         steps.push_back(Step{
             .opts = {
                 .name = opts.name.value_or("run-" + target->opts.name),
-                .description = opts.desc.value_or("Run this exe"),
+                .desc = opts.desc.value_or("Run this exe"),
                 .phony = true,
                 .silent = false,
             },
@@ -367,7 +367,7 @@ public:
     }
 
     Step* install(Step* step, Path dest) {
-        steps.push_back(Step{.opts = {.name = "install-" + step->opts.name, .description = "Installs " + step->opts.name, .silent = false}, .idx = steps.size()});
+        steps.push_back(Step{.opts = {.name = "install-" + step->opts.name, .desc = "Installs " + step->opts.name, .silent = false}, .idx = steps.size()});
         auto file_install_step = &steps.back();
         file_install_step->dependOn(step);
         install_step->dependOn(file_install_step);
@@ -761,93 +761,3 @@ int main(int argc, char** argv) { // NOLINT
     bf.runRequestedSteps();
     return 0;
 }
-
-//// EXAMPLE: paste it into your build.cpp
-/*
-
-// This is a bootstrap command, except it's missing "-o b && ./b -h"
-#define RECOMPILE_SELF_CMD "clang++ -g -std=c++20 build.cpp"
-#include "buildpp.h"
-
-#include <fstream>
-
-// you can use your functions here
-void genMyFile(Build* b, Path out_path, Path gen_config_path) {
-    printf("Writing to %s based on %s\n", out_path.c_str(), gen_config_path.c_str());
-    std::ifstream in{gen_config_path, std::ios_base::in};
-    if (!in.is_open()) b->panic("Can not open file %s", gen_config_path.c_str());
-    bool value;
-    in >> value;
-
-    std::fstream out{out_path, std::ios_base::out};
-    if (!out.is_open()) b->panic("Can not open file %s", out_path.c_str());
-    out << "constexpr bool flag =";
-    out << value;
-    out << ";";
-}
-
-void build(Build* b) {
-    // this option will automatically pop-up at ./b help message
-    // note, that if you remove option, it will still be on the help list
-    // to remove it from there, re-bootstrap build
-    auto cg_cfg = b->option<std::string>("codegen-configuration", "My very nice option description");
-
-    auto gen_config_path = Path{"gen_config.json"};
-    auto gen_includes_path = b->out / "generated" / "include";
-
-    if (cg_cfg) { // example of optional codegen in configuration-time, just if-statement
-        genMyFile(b, gen_includes_path / cg_cfg.value(), gen_config_path);
-    }
-
-    // creates several "Steps" of compilation
-    // you can view list of them using `./b list` (some of them are hidden)
-    auto main = b->addTarget({
-        .name = "main", .desc = "Main executable",
-        .type = Target::Type::Exe,
-        // sources and output path is appended to the end as ` -o {out} [{source-file}..]`
-        // command must be ready for it
-        // in future I want to add some helpers to generate this command based on compiler you are using
-        // Big limitation here is the single output file of every "Step" :(
-        .command = "clang++ -x c++ -Wall -I " + gen_includes_path.string(),
-        .sources = {
-            Path{"main.cpp"},
-            Path{"foo.cpp"},
-            Path{"bar.cpp"},
-        },
-    });
-    // Creates new "Step" (and returns it), that will copy file into output folder, if something changed
-    // results of installed "Step"s will be copied into "build" folder
-    b->install(main->step, Path{"bin/main"});
-
-    // Example of code-generation during build-time
-    // we inject into build graph and add 
-    auto cg_build = b->option<std::string>("codegen-build");
-    auto build_codegen = b->addStep({
-        .name = "generate-file-in-build-time",
-        .description = "Demonstration of codegen in built-time",
-        .phony = true, // always out-of-date
-    });
-    // this hook is crucial. hash you return will be used to access kv-cache node
-    // in this example we ignore input hash (of our dependencies) and return hash of our input
-    build_codegen->scan_deps = [=](Hash) { return stableHashFile(gen_config_path); };
-    // this lambda will be called after build(b) returns at build-time
-    // you can access your dependencies and their arts here
-    // "out" is the file path you need to fill. it will be stored to be reused between runs
-    build_codegen->action = [=](Path out) { genMyFile(b, out, gen_config_path); };
-
-    // example of using result of installation
-    auto installed = b->install(build_codegen, Path{"generated/include/file.h"});
-    main->step->dependOn(installed);
-
-    // Creates "Step" that will execute art of some target with arguments
-    // b->cli_args is arguments you can supply like this:
-    // ./b step1 step2 step3 -- arg1 arg2 ...
-    // you can append something to them, however you like
-    b->addTargetRun(main, { .name = "run", .args = b->cli_args});
-
-    // this will dump compile_commands.json , needed for ides to reason about how your program builds
-    // best is to call it at the end of the file
-    b->generateCompileCommandsJson(Dir{"."});
-}
-
-*/
