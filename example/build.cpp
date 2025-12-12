@@ -1,108 +1,65 @@
-// For boostraping, you need to run: clang++ -g -std=c++20 build.cpp -o b && ./b -h
-// After bootstrapping, you can just run ./b with any arguments and it will recompile itself and the project when needed
-// And this command will be used to recompile build.cpp when needed
-#define RECOMPILE_SELF_CMD "clang++ -g -std=c++20 build.cpp"
-#include "../buildpp.h"
-
-#include <fstream>
+#define BPP_RECOMPILE_SELF_CMD "${CXX} -g"
+#include "buildpp.h"
 
 // you can use your functions here
 void genMyFile(Build* b, Path out_path, Path gen_config_path) {
-    printf("Writing to %s based on %s\n", out_path.c_str(), gen_config_path.c_str());
+    Colorizer c{stdout};
+    log("%sWriting to %s based on %s%s\n", c.cyan(), out_path.c_str(), gen_config_path.c_str(), c.reset());
     std::ifstream in{gen_config_path, std::ios_base::in};
-    if (!in.is_open()) b->panic("Can not open file %s", gen_config_path.c_str());
-    bool value;
+    if (!in.is_open()) panic("Can not open file %s", gen_config_path.c_str());
+    std::string value;
     in >> value;
 
+    std::filesystem::create_directories(out_path.parent_path());
     std::fstream out{out_path, std::ios_base::out};
-    if (!out.is_open()) b->panic("Can not open file %s", out_path.c_str());
-    out << "constexpr bool flag =";
-    out << value;
-    out << ";";
+    if (!out.is_open()) panic("Can not open file %s", out_path.c_str());
+    out << "constexpr std::string_view flag = \"" << escapeStringJSON(value) << "\";";
 }
 
-// build(Build* b) -- Close to cmake script, it generates build graph that will be executed after by the job system.
-//   Important difference is that this two, usually distinct, phases are merged into one call to ./b
-//   And well, yea, no cmake language, just c++
-//
-// Step            -- Is a single build action, that can depend on other steps.
-//   All build actions are represented as Steps: compiling a target, installing a file, running codegen, etc.
-//   Each Step has it's own hash, that is calculated based on its dependencies and scan_deps function.
-//   Each step must produce exactly one artifact (file) as output and store it at `out` path provided to action function.
-//   
-// Target          -- Basically a one or many compilation units, producing SINGLE file.
-//   Some abstraction over step, that will break down your target into steps.
-//   For example, if you create Target of type Exe with several source files, it will create several object-file Steps and one linking Step.
-//   In future I want to add more helpers to generate commands based on compiler you are using or maybe ditch std::string command completely
-//     in favor of some structured representation. But it requires a lot more work.
-//   scan_deps is pre-defined for Targets
-//
-// Run             -- A special Step that will run some target's artifact with provided arguments.
-//
-// Build           -- Main class that holds the build graph.
-
 void build(Build* b) {
-    // this option will automatically pop-up at `./b help` message
-    // note, that if you remove option, it will still be on the help list
-    // to remove it from there, re-bootstrap build
-    auto cg_cfg = b->option<std::string>("codegen-configuration", "My very nice option description");
-
-    auto gen_config_path = Path{"gen_config.json"};
+    auto enable_x = b->option<bool>("enable-x", "Enable feature X");
+    auto gen_config_path = b->option<std::string>("codegen-configuration", "My very nice option description").value_or("gen_config.json");
     auto gen_includes_path = b->out / "generated" / "include";
+    std::filesystem::create_directories(gen_includes_path);
 
-    if (cg_cfg) { // example of optional codegen in configuration-time, just if-statement
-        genMyFile(b, gen_includes_path / cg_cfg.value(), gen_config_path);
-    }
+    auto flags = std::string{};
+    flags += " -std=c++20";
+    flags += " -g";
+    flags += " -fsanitize=address";
+    flags += " -flto";
 
-    // creates several "Steps" of compilation
-    // you can view list of them using `./b list` (some of them are hidden)
-    auto main = b->addTarget({
-        .name = "main", .desc = "Main executable",
-        .type = Target::Type::Exe,
-        // sources and output path is appended to the end as ` -o {out} [{source-file}..]`
-        // command must be ready for it
-        // in future I want to add some helpers to generate this command based on compiler you are using
-        // Big limitation here is the single output file of every "Step" :(
-        .command = "clang++ -x c++ -Wall -I " + gen_includes_path.string(),
-        .sources = {
-            Path{"main.cpp"},
-            Path{"foo.cpp"},
-            Path{"bar.cpp"},
+    auto main = b->addExecutable({
+        .name = "main",
+        .desc = "My main binary artefact",
+        .compiler = "${CXX}", // used for both compiling and linking
+        .flags = {
+            .include_paths = { gen_includes_path },
+            .libraries = {},
+            .defines = { {"ENABLE_FEATURE_X", enable_x.value_or(false) ? "1" : "0"} },
+            .extra_flags = flags, // this options will be passed to both "compiler" and "linker" steps
         },
+        .linker_flags = "-gz=zlib", // passed to only link-step
+    }, {
+        Path{"main.cpp"},
+        Path{"foo.cpp"},
+        Path{"bar.cpp"},
     });
-    // Creates new "Step" (and returns it), that will copy file into output folder, if something changed
-    // results of installed "Step"s will be copied into "build" folder
-    b->install(main->step, Path{"bin/main"});
+    b->install(main, "bin/main");
 
-    // Example of code-generation during build-time
-    // we inject into build graph and add new step before building main
-    auto cg_build = b->option<std::string>("codegen-build");
-    auto build_codegen = b->addStep({
-        .name = "generate-file-in-build-time",
-        .desc = "Demonstration of codegen in built-time",
-        .phony = true, // always out-of-date
+    auto codegen = b->addStep({
+        .name = "codegen",
+        .desc = "Generates code based on configuration",
+        .silent = false,
     });
-    // this hook is crucial. hash you return will be used to access kv-cache node
-    // in this example we ignore input hash (of our dependencies) and return hash of our real input
-    // that is a content of file at gen_config_path
-    // if you don't do this, your output path will be 0 and you will screw up cache
-    build_codegen->scan_deps = [=](Hash) { return stableHashFile(gen_config_path); };
-    // this lambda will be called after build(b) returns at build-time
-    // you can access your dependencies and their arts here
-    // "out" is the file path you need to fill. it will be stored to be reused between runs
-    build_codegen->action = [=](Path out) { genMyFile(b, out, gen_config_path); };
+    auto codegened_path = gen_includes_path / "file.h";
+    codegen->inputs_hash = [=](Hash h) -> Hash { return hashFile(gen_config_path); }; // hash everything your step depends on
+    codegen->action = [=](Output out) { genMyFile(b, out, gen_config_path); }; // write to out path
+    auto installed_cg = b->install(codegen, codegened_path);
+    main->dependOn(installed_cg); // ensure codegen runs and copied to codegened_path before main is built
 
-    // example of using result of installation
-    auto installed = b->install(build_codegen, Path{"generated/include/file.h"});
-    main->step->dependOn(installed);
-
-    // Creates "Step" that will execute art of some target with arguments
-    // b->cli_args is arguments you can supply like this:
-    // ./b step1 step2 step3 -- arg1 arg2 ...
-    // you can append something to them, however you like
-    b->addTargetRun(main, { .name = "run", .desc = "Run the main executable", .args = b->cli_args});
+    // Creates "Step" that will execute artefact of some target with arguments.
+    b->addRun(main, { .name = "run", .desc = "Run the main executable", .args = b->cli_args});
 
     // this will dump compile_commands.json , needed for ides to reason about how your program builds
-    // best is to call it at the end of the file
-    b->generateCompileCommandsJson(Dir{"."});
+    b->dump_compile_commands = true;
 }
