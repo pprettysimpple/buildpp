@@ -1,5 +1,7 @@
 ### C++ header-only build tooling
 
+#### Project is in development, things to do: compile_commands.json generation, better help, targets list, build subprojects
+
 Many thanks to nob.h and build.zig for inspiration. Without this projects at my hands I would never be able to create this tool.
 
 First idea is that you must be able to build c++ sources using only c++ compiler.
