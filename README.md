@@ -1,4 +1,4 @@
-### My build tooling
+### C++ header-only build tooling
 
 Many thanks to nob.h and build.zig for inspiration. Without this projects at my hands I would never be able to create this tool.
 
