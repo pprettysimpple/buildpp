@@ -1,3 +1,2 @@
 void foo();
 void bar();
-

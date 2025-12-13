@@ -113,6 +113,27 @@ struct Colorizer {
         exitFailedOrTrap(1); \
     } while (0)
 
+std::string escapeStringJSON(std::string_view arg) {
+    std::string escaped;
+    for (char c : arg) {
+        if (c == '"') {
+            escaped += '\\';
+        }
+        escaped += c;
+    }
+    return escaped;
+}
+
+std::string escapeStringBash(std::string_view arg) {
+    std::string escaped;
+    for (char c : arg) {
+        if (c == '\'' || c == '"' || c == '\\') {
+            escaped += '\\';
+        }
+        escaped += c;
+    }
+    return escaped;
+}
 
 using Path = std::filesystem::path;
 using Dir = std::filesystem::path;
@@ -125,19 +146,12 @@ struct Step {
         std::string desc;
         bool phony{false};
         bool silent{false};
-        bool report_time{false};
     } opts;
 
     // Plain dependencies - other steps that must be completed before this one.
     std::vector<Step*> deps = {};
     // Input dependencies - can be used in target command template as {in}
     std::vector<Step*> inputs = {};
-    // NOTE: For targets, dependency is a bit tricky
-    //       If you make executable and make it depend on codegen,
-    //       you expect that codegen is run before compiling any target of this exe
-    //       But targets are different steps. So if you make target depend on something,
-    //       We make each node in target_deps depend on that something
-    std::vector<Step*> target_deps = {};
 
     std::function<Hash(Hash)> inputs_hash = [](Hash h) { return h; }; // what this step depends other than other steps
     std::function<void(Output)> action = [](Output) {};
@@ -152,16 +166,8 @@ struct Step {
     }
 
     void dependOn(Step* other) {
-        this->deps.push_back(other);
-        for (auto* target_dep : this->target_deps) {
-            target_dep->dependOn(other);
-        }
+        deps.push_back(other);
     }
-};
-
-enum class Compiler {
-    Clang,
-    LDD,
 };
 
 struct Define {
@@ -169,63 +175,95 @@ struct Define {
     std::string value;
 };
 
-// struct Target {
-//     enum class Type {
-//         Exe,
-//         StaticLib,
-//         SharedLib,
-//     };
-
-    
-// };
-
-struct CompileFlags {
+struct Flags {
+    Path compile_driver = "${CXX}";
     std::vector<Path> include_paths = {};
     std::vector<Path> libraries = {};
     std::vector<Define> defines = {};
     std::string extra_flags = "";
 };
 
-struct Compile {
-    std::string name;
-    std::string desc = "";
-
-    // Template options:
-    // - {src} - source file[s]
-    // - {out} - output file (only one)
-    std::string cmd;
-    CompileFlags flags;
-
-    // if you provide sources, they will be used in compile string as {src}. inputs are still accessible as {in}
-    std::vector<Path> sources = {};
+struct ObjOpts {
+    Flags flags;
+    Path source;
 };
 
-struct Executable {
-    std::string name;
-    std::string desc = "";
-    Path compiler = "clang++";
-    CompileFlags flags;
-    std::string linker_flags = "";
-};
-
-void commandAddFlags(std::string* out, CompileFlags flags) {
-    *out += " " + flags.extra_flags;
-    for (const auto& def : flags.defines) {
-        *out += " -D" + def.name;
-        if (!def.value.empty()) {
-            *out += "=" + def.value;
-        }
-    }
-    for (const auto& inc : flags.include_paths) *out += " -I" + inc.string();
-    for (const auto& lib : flags.libraries) *out += " -l" + lib.string();
-}
-
-struct TargetInfo {
-    std::string name;
-    std::string desc = "";
-    std::variant<Compile> opts;
+struct Obj {
+    ObjOpts opts;
     Step* step;
 };
+
+struct ExecutableOpts {
+    std::string name;
+    std::string desc = "";
+    Flags obj = {};
+    Flags link = {};
+};
+
+struct Exe {
+    ExecutableOpts opts;
+    Step* link_step;
+
+    // executable depends on other step, meaning that other step must be completed before building this exe
+    void dependExeOn(Step* other) {
+        link_step->deps.push_back(other);
+        for (auto in : link_step->inputs) {
+            in->deps.push_back(other);
+        }
+    }
+};
+
+struct StaticLinkTool {
+    Path path;
+};
+
+struct LibraryOpts {
+    std::string name;
+    std::string desc = "";
+    Flags obj = {};
+    std::variant<Flags, StaticLinkTool> link;
+};
+
+struct Lib {
+    LibraryOpts opts;
+    Step* link_step;
+
+    // lib depends on other step, meaning that other step must be completed before building this lib
+    void dependLibOn(Step* other) {
+        link_step->deps.push_back(other);
+        for (auto in : link_step->inputs) {
+            in->deps.push_back(other);
+        }
+    }
+
+    std::string libName() const {
+        if (std::holds_alternative<StaticLinkTool>(opts.link)) {
+            return "lib" + opts.name + ".a";
+        } else {
+            return "lib" + opts.name + ".so";
+        }
+    }
+};
+
+void cmdRenderCompile(std::string* cmd, Flags flags, std::vector<Path> sources, std::vector<Path> inputs, Path out) {
+    *cmd += flags.compile_driver;
+    *cmd += " " + flags.extra_flags;
+    for (const auto& def : flags.defines) {
+        *cmd += " -D" + def.name;
+        if (!def.value.empty()) {
+            *cmd += "=" + def.value;
+        }
+    }
+    for (const auto& inc : flags.include_paths) *cmd += " -I" + inc.string();
+    for (const auto& lib : flags.libraries) *cmd += " -l" + lib.string();
+
+    for (auto src : sources) *cmd += " \"" + escapeStringJSON(src.string()) + "\"";
+    for (auto in : inputs) *cmd += " \"" + escapeStringJSON(in.string()) + "\"";
+    if (!out.empty()) *cmd += " -o " + out.string();
+}
+
+void cmdRenderLinkStaticLib(std::string* cmd, std::vector<Path> inputs, Path out) {
+}
 
 struct RunOptions {
     std::string name;
@@ -276,7 +314,7 @@ inline Hash hashString(std::string_view str) {
     return hash;
 }
 
-inline Hash hashFlags(const CompileFlags& flags) {
+inline Hash hashFlags(const Flags& flags) {
     Hash hash{};
     for (const auto& def : flags.defines) {
         hash = hash.combine(hashString(def.name));
@@ -330,28 +368,6 @@ struct CompileCommandsEntry {
 using Clock = std::chrono::high_resolution_clock;
 using Timestamp = std::chrono::time_point<Clock>;
 
-std::string escapeStringJSON(std::string_view arg) {
-    std::string escaped;
-    for (char c : arg) {
-        if (c == '"') {
-            escaped += '\\';
-        }
-        escaped += c;
-    }
-    return escaped;
-}
-
-std::string escapeStringBash(std::string_view arg) {
-    std::string escaped;
-    for (char c : arg) {
-        if (c == '\'' || c == '"' || c == '\\') {
-            escaped += '\\';
-        }
-        escaped += c;
-    }
-    return escaped;
-}
-
 void commandReplacePatternIfExist(std::string* cmd, std::string_view pattern, std::vector<Path> paths) {
     if (auto pos = cmd->find(pattern); pos != std::string::npos) {
         std::string replacement;
@@ -370,6 +386,7 @@ private:
     std::vector<std::string> requested_steps;
     bool verbose = false;
     bool silent = false;
+    bool report_help = false;
     int max_parallel_jobs = -1;
 
     Dir root;
@@ -377,9 +394,12 @@ private:
 
     std::unordered_map<std::string, std::optional<std::string>> parsed_options; // order same as old_options
     std::unordered_map<std::string, Option> options; // contains old options as well
-    std::list<TargetInfo> targets;
+    // std::list<TargetInfo> targets;
     std::list<std::pair<RunOptions, Step*>> runs;
     std::list<Step> steps;
+    std::list<Obj> objs;
+    std::list<Exe> exes;
+    std::list<Lib> libs;
     std::vector<std::pair<Step*, Path>> install_list;
     Step* install_step = nullptr;
     Step* build_all_step = nullptr;
@@ -387,12 +407,27 @@ private:
 
     Timestamp glob_start_time;
     Timestamp build_phase_start;
+    bool build_phase_started = false;
 public:
     Dir out;
     std::vector<std::string> cli_args;
     std::optional<bool> dump_compile_commands;
 
-    Build(int argc, char** argv, Dir root, Dir cache, Dir out) : root(root), cache(cache), out(out) {
+    Build(int argc, char** argv) {
+        std::error_code ec;
+        root = Path{argv[0]}.parent_path();
+        if (root.empty()) root = std::filesystem::current_path();
+        
+        auto env_cache = std::getenv("CACHE_PREFIX");
+        cache = Dir{env_cache ? env_cache : ".cache"}; 
+        cache = root / cache;
+        
+        auto env_prefix = std::getenv("PREFIX");
+        out = Dir{env_prefix ? env_prefix : "build"};
+        out = root / out;
+        
+        std::filesystem::create_directories(cache, ec);
+        std::filesystem::create_directories(out, ec);
         glob_start_time = Clock::now();
         std::filesystem::create_directories(cache / "arts");
         std::filesystem::create_directories(cache / "deps");
@@ -408,55 +443,8 @@ public:
 
         install_step = addStep({.name = "install", .desc = "Install targets", .silent = false});
         
-        build_all_step = addStep({.name = "build", .desc = "Build all targets", .silent = false, .report_time = true});
-        build_all_step->dependOn(install_step);
-        
-        auto list = addStep({.name = "list", .desc = "List available steps", .silent = false});
-        list->action = [this](Output) {
-            Colorizer c{stdout};
-
-            if (verbose) {
-                log("%s%sSteps:%s\n", c.cyan(), c.bold(), c.reset());
-                for (const auto& step : steps) {
-                    if (step.opts.silent) continue;
-                    log("%s%s  %s%s :: %s\n", c.bold(), c.blue(), step.opts.name.c_str(), c.reset(), step.opts.desc.c_str());
-                }
-            }
-
-            log("%s%sTargets:%s\n", c.cyan(), c.bold(), c.reset());
-            for (const auto& ti : targets) {
-                if (ti.step->opts.silent) continue;
-                log("%s%s  %s%s :: %s\n", c.bold(), c.blue(), ti.name.c_str(), c.reset(), ti.desc.c_str());
-            }
-        };
-
-        auto help = addStep({.name = "help", .desc = "Show help message", .phony = true, .silent = false});
-        help->action = [this](Output) {
-            Colorizer c{stdout};
-            log("%s%sBuild tool help:%s\n", c.cyan_bright(), c.bold(), c.reset());
-            log("Usage: %s [options] [steps] [-- run-args]\n", saved_argv[0]);
-
-            log("%s%sGeneric options:%s\n", c.cyan(), c.bold(), c.reset());
-            log("%s  -h, --help%s               Show this help message\n", c.magenta(), c.reset());
-            log("%s  -s, --silent%s             Silent mode, suppress output except errors\n", c.magenta(), c.reset());
-            log("%s  -v, --verbose%s            Enable verbose output\n", c.magenta(), c.reset());
-            log("%s  -j, --jobs <num>%s         Set maximum parallel jobs (default: number of CPU cores)\n", c.magenta(), c.reset());
-            log("%s  --dump-compile-commands%s  Dump compile_commands.json file in root directory\n", c.magenta(), c.reset());
-
-            log("%s%sOptions:%s\n", c.cyan(), c.bold(), c.reset());
-            for (const auto& [_, opt] : options) {
-                log("%s  -D%s%s", c.magenta(), opt.key.c_str(), c.reset());
-                if (!opt.description.empty()) {
-                    log(" :: %s", opt.description.c_str());
-                }
-                log("\n");
-            }
-
-            log("%s%sCommands:%s\n", c.cyan(), c.bold(), c.reset());
-            for (const auto& [opts, step] : runs) {
-                log("%s  %s %s:: Run exe %s\n", c.bold(), opts.name.c_str(), c.reset(), step->inputs[0]->opts.name.c_str());
-            }
-        };
+        build_all_step = addStep({.name = "build", .desc = "Build all targets", .silent = false});
+        build_all_step->deps.push_back(install_step);
     }
 
     template <typename T>
@@ -503,51 +491,70 @@ public:
         }
     }
 
-    Step* addExecutable(Executable exe, std::vector<Path> sources = {}) {
-        auto link_cmd = std::string{};
-        link_cmd += exe.compiler.string();
-        commandAddFlags(&link_cmd, exe.flags);
-        link_cmd += " -o {out} {in}";
-        link_cmd += " " + exe.linker_flags;
-        for (auto lib : exe.flags.libraries) {
-            link_cmd += " -l" + lib.string();
-        }
+    Exe* addExecutable(ExecutableOpts opts, std::vector<Path> sources = {}) {
+        auto step = addStep({.name = opts.name, .desc = opts.desc});
+        exes.push_back({.opts = opts, .link_step = step});
+        auto exe = &exes.back();
 
-        auto main = addTarget({
-            .name = exe.name,
-            .desc = exe.desc,
-            .cmd = link_cmd,
-            .flags = exe.flags,
-            .sources = {}, // link target has no sources
-        });
         for (auto src : sources) {
-            auto compile_cmd = std::string{};
-            compile_cmd += exe.compiler.string();
-            commandAddFlags(&compile_cmd, exe.flags);
-            compile_cmd += " -o {out} -c {src}";
-
-            auto obj = addTarget({
-                .name = Path{src}.replace_extension("o"),
-                .cmd = compile_cmd,
-                .flags = exe.flags,
-                .sources = {src},
-            });
-            obj->opts.silent = true;
-            obj->inputs.push_back(addFile(src));
-            main->inputs.push_back(obj);
-            main->target_deps.push_back(obj); // ensure main dependencies propagated to obj as well
-
-            // add all object files to compile commands
-            auto compile_cmd_full = compile_cmd;
-            commandReplacePatternIfExist(&compile_cmd_full, "{in}", {src});
-            commandReplacePatternIfExist(&compile_cmd_full, "{out}", {Path{src}.replace_extension("o")});
-            compile_commands_list.push_back(CompileCommandsEntry{
-                .command = compile_cmd_full,
-                .file = src,
-                .dir = Path{"."},
-            });
+            auto obj = addObject({.flags = opts.obj, .source = src}, true);
+            step->inputs.push_back(obj->step);
         }
-        return main;
+
+        step->inputs_hash = [this, exe](Hash h) { return h.combine(hashFlags(exe->opts.link)); };
+        step->action = [this, exe](Output out) {
+            std::string cmd;
+            cmdRenderCompile(&cmd, exe->opts.link, {}, completedInputs(exe->link_step), out);
+            if (verbose) log("Linking exe cmd: %s\n", cmd.c_str());
+            int res = std::system(cmd.c_str());
+            if (res != 0) panic("Link step command failed with code %d", res);
+        };
+
+        return exe;
+    }
+
+    Lib* addLib(LibraryOpts opts, std::vector<Path> sources = {}) {
+        auto step = addStep({.name = opts.name, .desc = opts.desc});
+        build_all_step->deps.push_back(step);
+        libs.push_back({.opts = opts, .link_step = step});
+        auto lib = &libs.back();
+
+        for (auto src : sources) {
+            auto obj = addObject({.flags = opts.obj, .source = src}, true);
+            step->inputs.push_back(obj->step);
+        }
+
+        step->inputs_hash = [this, lib](Hash h) {
+            if (auto link_flags = std::get_if<Flags>(&lib->opts.link)) {
+                h = h.combine(hashFlags(*link_flags)); // shared-lib
+            }
+            if (auto static_link = std::get_if<StaticLinkTool>(&lib->opts.link)) {
+                h = h.combine(hashString(static_link->path.string())); // static-lib
+            }
+            return h;
+        };
+        step->action = [this, lib](Output out) {
+            auto inputs = completedInputs(lib->link_step);
+            std::string cmd;
+            if (auto static_link = std::get_if<StaticLinkTool>(&lib->opts.link)) { // static
+                cmd += static_link->path.string();
+                cmd += " rsc";
+                cmd += " " + out.string();
+                for (auto in : inputs) {
+                    cmd += " " + in.string();
+                }
+            }
+            if (auto link_flags = std::get_if<Flags>(&lib->opts.link)) { // shared
+                auto flags = *link_flags;
+                flags.extra_flags += " -shared";
+                cmdRenderCompile(&cmd, flags, {}, inputs, out);
+            }
+            if (verbose) log("Linking lib cmd: %s\n", cmd.c_str());
+            int res = std::system(cmd.c_str());
+            if (res != 0) panic("Link step command failed with code %d", res);
+        };
+
+        return lib;
     }
 
     // adds file, wrapped as step. to be used later in some step inputs
@@ -563,43 +570,42 @@ public:
         return file_step;
     }
 
-    Step* addTarget(Compile opts) {
-        auto target = addStep(Step::Options{.name = opts.name, .desc = opts.desc});
-        targets.push_back({.name = opts.name, .desc = opts.desc, .opts = opts, .step = target});
-        build_all_step->dependOn(target);
+    // step must compile one object file from source
+    Obj* addObject(ObjOpts opts, bool silent = false) {
+        auto step = addStep({
+            .name = Path{opts.source}.replace_extension("o").string(),
+            .desc = "Object file for " + Path{opts.source}.filename().string(),
+            .silent = silent
+        });
+        step->inputs.push_back(addFile(opts.source));
 
-        target->inputs_hash = [this, opts, target](Hash h) {
-            auto inputs = completedInputs(target);
-            h = h.combine(hashString(opts.name));
-            h = h.combine(hashFlags(opts.flags));
-            h = h.combine(hashString(opts.cmd));
-            Hash in_h{0};
-            for (auto in : inputs) {
-                in_h = in_h.combineUnordered(hashFile(in));
-            }
-            h = h.combine(in_h);
-            Hash src_h{};
-            for (auto src : opts.sources) {
-                src_h = src_h.combineUnordered(buildEntireSourceFileHashCached(opts.cmd, src, inputs));
-            }
+        objs.push_back({opts, step});
+        auto obj = &objs.back();
+
+        step->inputs_hash = [this, obj](Hash h) {
+            auto inputs = completedInputs(obj->step);
+            h = h.combine(hashString(obj->opts.source.string()));
+            h = h.combine(hashFile(obj->opts.source));
+            h = h.combine(hashFlags(obj->opts.flags));
+            Hash src_h = buildEntireSourceFileHashCached(obj->opts.flags, obj->opts.source);
             h = h.combine(src_h);
             return h;
         };
-
-        target->action = [this, opts, target](Output out) mutable { // action is invoked when step must be performed
-            auto cmd = opts.cmd;
-            commandReplacePatternIfExist(&cmd, "{in}", completedInputs(target));
-            commandReplacePatternIfExist(&cmd, "{src}", opts.sources);
-            commandReplacePatternIfExist(&cmd, "{out}", {out});
-            if (verbose) blog("Compile command: %s\n", cmd.data());
+        step->action = [this, obj](Output out) mutable { // action is invoked when step must be performed
+            std::string cmd;
+            auto flags = obj->opts.flags;
+            flags.extra_flags += " -c"; // compiling to just object file
+            cmdRenderCompile(&cmd, flags, {obj->opts.source}, {}, out); // inputs 
+            if (verbose) blog("Compile Obj command: %s\n", cmd.data());
 
             auto ret = std::system(cmd.data());
-            if (ret != 0) panic("Failed to build target: %s\n", opts.name.c_str());
+            if (ret != 0) panic("Failed to build target: %s\n", obj->step->opts.name.c_str());
         };
-        return target;
+
+        return obj;
     }
 
-    Step* addRun(Step* target, RunOptions opts) {
+    Step* addRun(Exe* exe, RunOptions opts) {
         auto run = addStep({
             .name = opts.name,
             .desc = opts.desc,
@@ -607,8 +613,8 @@ public:
             .silent = false,
         });
         runs.push_back({opts, run});
-        run->inputs.push_back(target);
-        run->action = [this, opts, run, target](Output) {
+        run->inputs.push_back(exe->link_step);
+        run->action = [this, opts, run, exe](Output) {
             // invoke the built executable with args
             auto cmd = std::string{};
             cmd += "pushd " + opts.working_dir.string() + " > /dev/null && ";
@@ -619,26 +625,34 @@ public:
             }
             cmd += "&& popd > /dev/null";
             auto ret = std::system(cmd.data());
-            if (ret != 0) panic("Failed to run target: %s\n", target->opts.name.c_str());
+            if (ret != 0) panic("Failed to run exe: %s\n", exe->opts.name.c_str());
         };
         return run;
+    }
+
+    Step* installExe(Exe* exe, Path dest) {
+        return install(exe->link_step, "bin" / dest);
+    }
+
+    Step* installLib(Lib* lib, Path dest) {
+        return install(lib->link_step, "lib" / dest);
     }
 
     Step* install(Step* step, Path dest) {
         auto file_install_step = addStep(Step::Options{.name = "install-" + step->opts.name, .desc = "Installs " + step->opts.name, .silent = false});
         file_install_step->inputs.push_back(step);
-        install_step->dependOn(file_install_step);
-        file_install_step->inputs_hash = [this, step, dest](Hash h) {
+        install_step->deps.push_back(file_install_step);
+        file_install_step->inputs_hash = [=](Hash h) {
             auto child_path = cacheEntryOfStep(step);
             // check if destination file exists and equals to target artifact
-            if (!std::filesystem::exists(out / dest)) return Hash{step->hash->value + 1}; // bogus
-            auto dest_hash = hashFile(out / dest);
+            if (!std::filesystem::exists(dest)) return Hash{step->hash->value + 1}; // bogus
+            auto dest_hash = hashFile(dest);
             auto src_hash = hashFile(child_path);
             return dest_hash.value == src_hash.value ? h : Hash{step->hash->value + 1}; // bogus
         };
-        file_install_step->action = [this, step, dest, file_install_step](Output) {
+        file_install_step->action = [=](Output) {
             if (file_install_step->inputs.size() != 1) panic("Install step invoked with %lu files instead of 1\n", file_install_step->inputs.size());
-            blog("[%s] target %s -> %s\n", file_install_step->opts.name.c_str(), step->opts.name.c_str(), dest.c_str());
+            blog("[%s] target %s -> %s\n", file_install_step->opts.name.c_str(), step->opts.name.c_str(), (out / dest).c_str());
             // copy file from artifact cache to dest.path
             // but first ensure parent directory exists
             std::filesystem::create_directories((out / dest).parent_path());
@@ -655,8 +669,14 @@ public:
     }
 
     // you should not call it on your own
-    void runBuildPhase() {
-        if (dump_compile_commands) writeEntireFile(root / "compile_commands.json", generateCompileCommandsJson());
+    void runBuild() {
+        if (build_phase_started) panic("Build phase already started. Do NOT call runBuildPhase() multiple times\n");
+        build_phase_started = true;
+        if (report_help) {
+            reportHelp();
+            return;
+        }
+        if (dump_compile_commands) generateCompileCommandsJson(root / "compile_commands.json");
 
         std::vector<Step*> all_steps_flat;
         for (auto& step : steps) all_steps_flat.push_back(&step);
@@ -699,7 +719,6 @@ public:
             }
             step_visited[pos] = Gray;
             gray_stack.push_back(all_steps_flat[pos]);
-            steps_run_order.push_back(all_steps_flat[pos]);
             for (auto* dep : all_steps_flat[pos]->deps) {
                 visit(dep->idx);
             }
@@ -707,12 +726,17 @@ public:
             for (auto* dep : all_steps_flat[pos]->inputs) {
                 visit(dep->idx);
             }
+            steps_run_order.push_back(all_steps_flat[pos]);
             step_visited[pos] = Black;
             gray_stack.pop_back();
         };
 
         for (size_t i = 0; i < steps_to_perform.size(); i++) {
             visit(steps_to_perform[steps_to_perform.size() - i - 1]);
+        }
+
+        for (size_t i = 0; i < steps_run_order.size() / 2; ++i) {
+            std::swap(steps_run_order[i], steps_run_order[steps_run_order.size() - i - 1]);
         }
 
         build_phase_start = Clock::now();
@@ -763,7 +787,70 @@ public:
         }
     }
 
+    std::vector<Path> completedInputs(Step* step) {
+        if (!build_phase_started) panic("completedInputs(step) is available only inside of step action that is executed after build phase started\n");
+        std::vector<Path> res;
+        for (auto* input : step->inputs) {
+            if (!input->completed()) panic("Input step %s of step %s is not completed before dependant\n", input->opts.name.c_str(), step->opts.name.c_str());
+            res.push_back(cacheEntryOfStep(input));
+        }
+        return res;
+    }
+
 private:
+    void reportHelp() {
+        Colorizer c{stdout};
+        log("%s%sBuild tool help:%s\n", c.cyan_bright(), c.bold(), c.reset());
+        log("Usage: %s [options] [steps] [-- run-args]\n", saved_argv[0]);
+
+        log("%s%sGeneric options:%s\n", c.cyan(), c.bold(), c.reset());
+        log("%s  -h, --help%s               Show this help message\n", c.magenta(), c.reset());
+        log("%s  -s, --silent%s             Silent mode, suppress output except errors\n", c.magenta(), c.reset());
+        log("%s  -v, --verbose%s            Enable verbose output\n", c.magenta(), c.reset());
+        log("%s  -j, --jobs <num>%s         Set maximum parallel jobs (default: number of CPU cores)\n", c.magenta(), c.reset());
+        log("%s  --dump-compile-commands%s  Dump compile_commands.json file in root directory\n", c.magenta(), c.reset());
+
+        log("%s%sOptions:%s\n", c.cyan(), c.bold(), c.reset());
+        for (const auto& [_, opt] : options) {
+            log("%s  -D%s%s", c.magenta(), opt.key.c_str(), c.reset());
+            if (!opt.description.empty()) {
+                log(" :: %s", opt.description.c_str());
+            }
+            log("\n");
+        }
+
+        log("%s%sCommands:%s\n", c.cyan(), c.bold(), c.reset());
+        for (const auto& [opts, step] : runs) {
+            log("%s  %s %s:: Run exe %s\n", c.bold(), opts.name.c_str(), c.reset(), step->inputs[0]->opts.name.c_str());
+        }
+
+        if (verbose) {
+            log("%s%sSteps:%s\n", c.cyan(), c.bold(), c.reset());
+            for (const auto& step : steps) {
+                if (step.opts.silent) continue;
+                log("%s%s  %s%s :: %s\n", c.bold(), c.blue(), step.opts.name.c_str(), c.reset(), step.opts.desc.c_str());
+            }
+        }
+
+        // log("%s%sTargets:%s\n", c.cyan(), c.bold(), c.reset());
+        // for (const auto& ti : targets) {
+        //     if (ti.step->opts.silent) continue;
+        //     log("%s%s  %s%s :: %s\n", c.bold(), c.blue(), ti.name.c_str(), c.reset(), ti.desc.c_str());
+        // }
+
+        // // print graph
+        // for (const auto& step : steps) {
+        //     if (step.deps.empty() && step.inputs.empty()) continue;
+        //     log("%s%sStep %s dependencies:%s\n", c.cyan(), c.bold(), step.opts.name.c_str(), c.reset());
+        //     for (const auto& dep : step.deps) {
+        //         log("    %s- dep: %s%s\n", c.blue(), dep->opts.name.c_str(), c.reset());
+        //     }
+        //     for (const auto& inp : step.inputs) {
+        //         log("    %s- input: %s%s\n", c.green(), inp->opts.name.c_str(), c.reset());
+        //     }
+        // }
+    };
+
     template <typename F>
     auto recordTime(std::atomic<uint64_t>& total_time_us, F&& f) {
         return [this, &total_time_us, f = std::forward<F>(f)]() mutable {
@@ -795,14 +882,15 @@ private:
         return RecordTimeGuard{total_time_us};
     }
 
-    std::string generateCompileCommandsJson() {
+    void generateCompileCommandsJson(Path out) {
         // walk targets, prep json
         std::vector<std::string> cmds;
 
+        auto self_path = (root / "build.cpp").string();
         auto build_self_cmd = std::string{};
         build_self_cmd += "  {\n";
-        build_self_cmd += "    \"command\":\"" BPP_RECOMPILE_SELF_CMD " build.cpp\""; build_self_cmd += ",\n";
-        build_self_cmd += "    \"file\":\"build.cpp\""; build_self_cmd += ",\n";
+        build_self_cmd += "    \"command\":\"" + std::string{BPP_RECOMPILE_SELF_CMD} + " " + self_path + "\""; build_self_cmd += ",\n";
+        build_self_cmd += "    \"file\":\"" + self_path + "\""; build_self_cmd += ",\n";
         build_self_cmd += "    \"directory\":\".\"\n";
         build_self_cmd += "  }";
         cmds.push_back(build_self_cmd);
@@ -824,7 +912,14 @@ private:
             if (i + 1 != cmds.size()) res += ",\n";
         }
         res += "\n]";
-        return res;
+
+        std::filesystem::create_directories(out.parent_path());
+        auto cmd = std::string{};
+        cmd += "echo";
+        cmd += " \"" + escapeStringBash(res) + "\"";
+        cmd += " > \"" + out.string() + "\"";
+        auto ret = std::system(cmd.data());
+        if (ret != 0) panic("Failed to dump compile_commands.json to %s\n", out.c_str());
     }
 
     void parseArgs() {
@@ -857,7 +952,7 @@ private:
 
             // builtin options
             if (arg == "-h" || arg == "--help" || arg == "help") {
-                requested_steps.push_back("help");
+                report_help = true;
                 continue;
             }
 
@@ -898,10 +993,7 @@ private:
         }
 
         if (max_parallel_jobs <= 0) max_parallel_jobs = std::thread::hardware_concurrency();
-
-        if (requested_steps.empty()) {
-            requested_steps.push_back("build");
-        }
+        if (requested_steps.empty()) report_help = true;
     }
 
     void parseOldOptions() {
@@ -926,22 +1018,11 @@ private:
         options_file.close();
     }
 
-    Hash calcSelfHash() {
-        auto start = Clock::now();
-        auto cmd = std::string{};
-        cmd += BPP_RECOMPILE_SELF_CMD;
-        cmd += " -o {out} {src}";
-        return buildEntireSourceFileHashCached(cmd, "build.cpp", {});
-    }
-
-    [[nodiscard]] Hash buildEntireSourceFileHashCached(std::string compile_cmd, Path source_file, std::vector<Path> in) {
+    [[nodiscard]] Hash buildEntireSourceFileHashCached(Flags flags, Path source_file) {
         // scan deps using compiler on source_file
         auto cmd = std::string{};
-        cmd += compile_cmd;
+        cmdRenderCompile(&cmd, flags, {source_file}, {}, "{out}");
         cmd += " -M";
-        commandReplacePatternIfExist(&cmd, "{in}", in);
-        commandReplacePatternIfExist(&cmd, "{src}", {source_file});
-
         auto inputs_h = hashString(cmd).combine(hashFile(source_file));
         auto out = cacheEntryOfSourceDepfile(inputs_h);
         commandReplacePatternIfExist(&cmd, "{out}", {out});
@@ -959,25 +1040,26 @@ private:
     }
 
     void checkIfBuildScriptChanged() {
-        auto new_hash = calcSelfHash();
+        auto new_hash = buildEntireSourceFileHashCached({.compile_driver = BPP_RECOMPILE_SELF_CMD}, root / "build.cpp");
+        // this if helps avoid rebuilding tool if cache is purged completely
         std::ifstream hash_file{selfHashPath()};
-        if (!hash_file.is_open()) recompileSelf(new_hash, "no hash file found");
+        if (!hash_file.is_open()) recompileSelf(new_hash, "build tool hash file missing, can't verify self-consistency");
         Hash old_hash{0};
         hash_file >> old_hash.value;
         hash_file.close();
-        if (old_hash.value != new_hash.value) recompileSelf(new_hash, "source hashes mismatch");
+        if (old_hash.value != new_hash.value) recompileSelf(new_hash, "source hashes differ");
     }
 
-    void recompileSelf(Hash new_self_hash, std::string reason) {
+    void recompileSelf(Hash new_self_hash, const char* reason) {
         Colorizer c{stdout};
         // first things first, save hash
         writeEntireFile(selfHashPath(), std::to_string(new_self_hash.value));
         auto start = Clock::now();
         auto compile = std::string{};
         compile += BPP_RECOMPILE_SELF_CMD;
-        compile += " build.cpp";
+        compile += " " + (root / "build.cpp").string();
         compile += " -o " + std::string{saved_argv[0]} + " ";
-        blog("%s[*] Recompiling build tool, because %s...%s\n", c.yellow(), reason.data(), c.reset());
+        blog("%s[*] Recompiling build tool, because %s...%s\n", c.yellow(), reason, c.reset());
         auto ret = std::system(compile.data());
 
         if (ret != 0) {
@@ -988,7 +1070,7 @@ private:
         }
         // move cursor up one line to overwrite the recompilation message
         auto end = Clock::now();
-        blog("%s%s[+] Recompiled build tool in %.2f s%s\n", c.discard_prev_line(), c.gray(), std::chrono::duration<double>(end - start).count(), c.reset());
+        blog("%s%s[+] Recompiled build tool in %.2fs%s\n", c.discard_prev_line(), c.gray(), std::chrono::duration<double>(end - start).count(), c.reset());
 
         // execv to replace current process
         execv(saved_argv[0], saved_argv.data());
@@ -1042,10 +1124,7 @@ private:
             step->action(expected_path);
         }
         auto end = Clock::now();
-        if (step->opts.report_time) {
-            blog("%s[step]%s %s%s%s completed in %s%.2fs%s\n", c.gray(), c.reset(), c.yellow(), step->opts.name.c_str(), c.reset(),
-                 c.cyan(), std::chrono::duration<double>(end - build_phase_start).count(), c.reset());
-        } else if (!step->opts.silent) {
+        if (!step->opts.silent) {
             blog("%s[step]%s %s%s%s completed\n", c.gray(), c.reset(), c.yellow(), step->opts.name.c_str(), c.reset());
         }
         step->completed() = true;
@@ -1095,15 +1174,6 @@ private:
         return dep_files;
     }
 
-    std::vector<Path> completedInputs(Step* step) {
-        std::vector<Path> res;
-        for (auto* input : step->inputs) {
-            if (!input->completed()) panic("Input step %s of step %s is not completed before dependant\n", input->opts.name.c_str(), step->opts.name.c_str());
-            res.push_back(cacheEntryOfStep(input));
-        }
-        return res;
-    }
-
     Path cacheEntryOfSourceDepfile(Hash h) {
         return cache / "deps" / (std::to_string(h.value));
     }
@@ -1127,23 +1197,17 @@ private:
     }
 };
 
-void build(Build* b); // expected signature of build function
+void configure(Build* b); // expected signature of build function
 
 int main(int argc, char** argv) { // NOLINT
-    std::error_code ec;
-    auto root = std::filesystem::current_path(ec);
-    auto cache = root / Dir{".cache"}; std::filesystem::create_directories(cache, ec);
-    auto out = root / Dir{"build"}; std::filesystem::create_directories(out, ec);
-    auto self_source = root / Path{"build.cpp"};
-
-    Build b{argc, argv, root, cache, out};
+    Build b{argc, argv};
     try {
-        build(&b);
+        configure(&b);
     } catch (const std::exception& e) {
         panic("your build script exited with exception: %s\n", e.what());
     }
     try {
-        b.runBuildPhase();
+        b.runBuild();
     } catch (const std::exception& e) {
         panic("build phase exited with exception: %s\n", e.what());
     }
