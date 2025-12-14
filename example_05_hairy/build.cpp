@@ -13,17 +13,16 @@ void genMyFile(Build* b, Path out_path, Path config) {
 void configure(Build* b) {
     auto enable_x = b->option<bool>("enable-x", "Enable feature X").value_or(false);
 
-    auto flags = std::string{};
-    flags += " -std=c++20";
-    flags += " -g";
-    flags += " -fsanitize=address";
-    flags += " -flto";
-
     auto gen_includes_path = Path{"generated"} / "include";
     auto common_flags = Flags{
         .include_paths = { b->out / gen_includes_path }, // here 
         .defines = { {"ENABLE_FEATURE_X", enable_x ? "1" : "0"} },
-        .extra_flags = flags, // this options will be passed to both "compiler" and "linker" steps
+        .asan = true,
+        .lto = true,
+        .debug_info = true,
+        .warnings = true,
+        .optimize = Optimize::O2,
+        .standard = CXXStandard::CXX20,
     };
 
     auto foobar = b->addLib({
@@ -41,7 +40,7 @@ void configure(Build* b) {
         .name = "main",
         .desc = "My main binary artefact, that depends on libfoobar",
         .obj = common_flags,
-        .link = { .extra_flags = flags },
+        .link = common_flags,
     }, {
         "src/main.cpp",
     });

@@ -175,13 +175,42 @@ struct Define {
     std::string value;
 };
 
+enum Optimize {
+    O0,
+    O1,
+    O2,
+    O3,
+    Fast,
+};
+
+enum class CXXStandard {
+    CXX11,
+    CXX14,
+    CXX17,
+    CXX20,
+    CXX23,
+};
+
 struct Flags {
     Path compile_driver = "${CXX}";
     std::vector<Path> include_paths = {};
     std::vector<Path> libraries = {};
     std::vector<Define> defines = {};
+    bool asan = true;
+    bool lto = false;
+    bool debug_info = true;
+    bool warnings = true;
+    Optimize optimize = Optimize::O1;
+    std::optional<CXXStandard> standard = std::nullopt;
     std::string extra_flags = "";
 };
+
+void fixupLinkObjFlags(Flags* link, Flags* obj) {
+    if (obj->asan) link->asan = true;
+    if (link->asan) obj->asan = true;
+    if (link->lto) obj->lto = true;
+    if (obj->lto) link->lto = true;
+}
 
 struct ObjOpts {
     Flags flags;
@@ -254,15 +283,32 @@ void cmdRenderCompile(std::string* cmd, Flags flags, std::vector<Path> sources, 
             *cmd += "=" + def.value;
         }
     }
+    if (!flags.warnings) *cmd += " -w";
+    if (flags.debug_info) *cmd += " -g";
+    if (flags.asan) *cmd += " -fsanitize=address";
+    if (flags.lto) *cmd += " -flto";
+    switch (flags.optimize) {
+        case Optimize::O0: *cmd += " -O0"; break;
+        case Optimize::O1: *cmd += " -O1"; break;
+        case Optimize::O2: *cmd += " -O2"; break;
+        case Optimize::O3: *cmd += " -O3"; break;
+        case Optimize::Fast: *cmd += " -Ofast"; break;
+    }
+    if (flags.standard.has_value()) {
+        switch (flags.standard.value()) {
+            case CXXStandard::CXX11: *cmd += " -std=c++11"; break;
+            case CXXStandard::CXX14: *cmd += " -std=c++14"; break;
+            case CXXStandard::CXX17: *cmd += " -std=c++17"; break;
+            case CXXStandard::CXX20: *cmd += " -std=c++20"; break;
+            case CXXStandard::CXX23: *cmd += " -std=c++23"; break;
+        }
+    }
     for (const auto& inc : flags.include_paths) *cmd += " -I" + inc.string();
     for (const auto& lib : flags.libraries) *cmd += " -l" + lib.string();
 
     for (auto src : sources) *cmd += " \"" + escapeStringJSON(src.string()) + "\"";
     for (auto in : inputs) *cmd += " \"" + escapeStringJSON(in.string()) + "\"";
     if (!out.empty()) *cmd += " -o " + out.string();
-}
-
-void cmdRenderLinkStaticLib(std::string* cmd, std::vector<Path> inputs, Path out) {
 }
 
 struct RunOptions {
@@ -327,6 +373,12 @@ inline Hash hashFlags(const Flags& flags) {
         hash = hash.combine(hashString(lib.string()));
     }
     hash = hash.combine(hashString(flags.extra_flags));
+    hash = hash.combine(Hash{static_cast<uint64_t>(flags.asan)});
+    hash = hash.combine(Hash{static_cast<uint64_t>(flags.lto)});
+    hash = hash.combine(Hash{static_cast<uint64_t>(flags.debug_info)});
+    hash = hash.combine(Hash{static_cast<uint64_t>(flags.optimize)});
+    hash = hash.combine(Hash{static_cast<uint64_t>(flags.warnings)});
+    if (flags.standard.has_value()) hash = hash.combine(Hash{static_cast<uint64_t>(flags.standard.value())});
     return hash;
 }
 
@@ -492,6 +544,8 @@ public:
     }
 
     Exe* addExecutable(ExecutableOpts opts, std::vector<Path> sources = {}) {
+        fixupLinkObjFlags(&opts.link, &opts.obj);
+
         auto step = addStep({.name = opts.name, .desc = opts.desc});
         exes.push_back({.opts = opts, .link_step = step});
         auto exe = &exes.back();
@@ -501,7 +555,9 @@ public:
             step->inputs.push_back(obj->step);
         }
 
-        step->inputs_hash = [this, exe](Hash h) { return h.combine(hashFlags(exe->opts.link)); };
+        step->inputs_hash = [this, exe](Hash h) {
+            return h.combine(hashFlags(exe->opts.link));
+        };
         step->action = [this, exe](Output out) {
             std::string cmd;
             cmdRenderCompile(&cmd, exe->opts.link, {}, completedInputs(exe->link_step), out);
@@ -514,6 +570,8 @@ public:
     }
 
     Lib* addLib(LibraryOpts opts, std::vector<Path> sources = {}) {
+        if (auto link_flags = std::get_if<Flags>(&opts.link)) fixupLinkObjFlags(link_flags, &opts.obj);
+
         auto step = addStep({.name = opts.name, .desc = opts.desc});
         build_all_step->deps.push_back(step);
         libs.push_back({.opts = opts, .link_step = step});
