@@ -4,7 +4,7 @@
 void configure(Build* b) {
     b->dump_compile_commands = true;
     
-    auto main = b->addExecutable({.name = "main", .desc = "My simple binary artefact"}, {"main.cpp"});
+    auto main = b->addExe({.name = "main", .desc = "My simple binary artefact"}, {"main.cpp"});
     b->installExe(main, "runme");
     b->addRun(main, {.name = "run", .desc = "Run the main executable", .args = b->cli_args});
 

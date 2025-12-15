@@ -15,7 +15,7 @@ void configure(Build* b) {
 
     auto gen_includes_path = Path{"generated"} / "include";
     auto common_flags = Flags{
-        .include_paths = { b->out / gen_includes_path }, // here 
+        .include_paths = { {.path = b->out / gen_includes_path} }, // here 
         .defines = { {"ENABLE_FEATURE_X", enable_x ? "1" : "0"} },
         .asan = true,
         .lto = true,
@@ -36,7 +36,7 @@ void configure(Build* b) {
     });
     b->installLib(foobar, foobar->libName());
 
-    auto main = b->addExecutable({
+    auto main = b->addExe({
         .name = "main",
         .desc = "My main binary artefact, that depends on libfoobar",
         .obj = common_flags,
@@ -44,14 +44,14 @@ void configure(Build* b) {
     }, {
         "src/main.cpp",
     });
-    main->link_step->inputs.push_back(foobar->link_step); // linking
+    main->link_step->inputs.push_back({.step = foobar->link_step}); // linking
     b->installExe(main, "main");
 
     auto codegen = b->addStep({
         .name = "codegen",
         .desc = "Generates code based on configuration",
     });
-    codegen->inputs.push_back(b->addFile("configs/codegen.json")); // make cg depend on config file
+    codegen->inputs.push_back(b->addFile("configs/codegen.txt")); // make cg depend on config file
     auto codegened_path = gen_includes_path / "file.h";
     // you provide the build action for this step
     // inputs are available via b->completedInputs(codegen)

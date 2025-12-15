@@ -4,7 +4,7 @@
 void configure(Build* b) {
     b->dump_compile_commands = true;
     
-    auto main = b->addExecutable({
+    auto main = b->addExe({
         .name = "main", .desc = "My simple binary artefact",
         .obj = Flags{
             .asan = true,
