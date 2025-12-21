@@ -1,9 +1,9 @@
 #!/bin/sh
 set -e
 CMD="$@"
-for example in example_*; do
-    cd $example
-    echo "At $example"
+for howto in how_to/*; do
+    cd $howto
+    echo "At $howto"
     bash -c "$CMD"
     cd - > /dev/null
 done
