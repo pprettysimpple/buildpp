@@ -1,11 +1,11 @@
 #pragma once
 
-// header that build.cpp includes
 #include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <charconv>
 #include <chrono>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -17,7 +17,6 @@
 #include <random>
 #include <string>
 #include <thread>
-#include <variant>
 #include <vector>
 #include <fstream>
 #include <array>
@@ -25,14 +24,18 @@
 #include <sstream>
 
 #include <unistd.h>
-#include <csignal>
+#include <signal.h> // for raise
+#include <dlfcn.h>
 
 #ifndef BPP_RECOMPILE_SELF_CMD
-#error R"(To use this library you need to setup how this script will be compiled This is done through this macro (where error is emited). Try to define it just before including header as follows: clang++ -g -std=c++20 build.cpp)"
+#error R"(To use this library you need to setup how this script will be compiled This is done through this macro (where error is emited). Try to define it just before including header as follows: clang++ -O0)"
 #endif
 
-std::mutex print_mutex;
-int log(const char* fmt, ...) {
+struct Build;
+void configure(Build* b); // expected signature of build function
+
+static std::mutex print_mutex;
+inline int log(const char* fmt, ...) {
     std::lock_guard<std::mutex> lock(print_mutex);
     va_list args;
     va_start(args, fmt);
@@ -42,7 +45,7 @@ int log(const char* fmt, ...) {
     return res;
 }
 
-int vlog(const char* fmt, va_list args) {
+inline int vlog(const char* fmt, va_list args) {
     std::lock_guard<std::mutex> lock(print_mutex);
     auto res = vprintf(fmt, args);
     fflush(stdout);
@@ -100,7 +103,7 @@ struct Colorizer {
     }
 };
 
-[[noreturn]] void exitFailedOrTrap(int code) {
+[[noreturn]] inline void exitFailedOrTrap(int code) {
 #ifdef BPP_DEBUG_MODE
     raise(SIGTRAP);
 #endif
@@ -115,7 +118,7 @@ struct Colorizer {
         exitFailedOrTrap(1); \
     } while (0)
 
-std::string escapeStringJSON(std::string_view arg) {
+inline std::string escapeStringJSON(std::string_view arg) {
     std::string escaped;
     for (char c : arg) {
         if (c == '"') {
@@ -126,7 +129,7 @@ std::string escapeStringJSON(std::string_view arg) {
     return escaped;
 }
 
-std::string escapeStringBash(std::string_view arg) {
+inline std::string escapeStringBash(std::string_view arg) {
     std::string escaped;
     for (char c : arg) {
         if (c == '\'' || c == '"' || c == '\\') {
@@ -166,14 +169,29 @@ struct Step {
 
     std::function<Hash(Hash)> inputs_hash = [](Hash h) { return h; }; // what this step depends other than other steps
     std::function<void(Output)> action = [](Output) {};
-    size_t idx;
 
     // NOTE: Step is considered up-to-date if its hash + combined hash of dependencies does not exist in cache
     std::optional<Hash> hash;
-    std::unique_ptr<std::atomic<bool>> completed_impl = std::make_unique<std::atomic<bool>>(false); // damn atomic makes it impossible to copy step
 
-    std::atomic<bool>& completed() { // to avoid writing buggy if(step->completed)
-        return *completed_impl;
+    // this thread-safety stuff is needed to allow parallel builds not stupidly wait for 16ms on each step
+    bool completed = false;
+    std::mutex completion_mutex;
+    std::condition_variable completion_cv;
+
+    bool threadSafeIsCompleted() {
+        std::lock_guard<std::mutex> lock(completion_mutex);
+        return completed;
+    }
+
+    void markCompleted() {
+        std::lock_guard<std::mutex> lock(completion_mutex);
+        completed = true;
+        completion_cv.notify_all();
+    }
+
+    void waitUntilCompleted() {
+        std::unique_lock<std::mutex> lock(completion_mutex);
+        completion_cv.wait(lock, [this]() { return completed; });
     }
 
     void dependOn(Step* other) {
@@ -187,6 +205,7 @@ struct Define {
 };
 
 enum Optimize {
+    Default,
     O0,
     O1,
     O2,
@@ -195,6 +214,7 @@ enum Optimize {
 };
 
 enum class CXXStandard {
+    Default,
     CXX11,
     CXX14,
     CXX17,
@@ -202,32 +222,73 @@ enum class CXXStandard {
     CXX23,
 };
 
-struct Flags {
-    Path compile_driver = "${CXX}";
+// leaving nullopt will make it be taken from global flags
+struct CXXFlagsOverlay {
+    std::optional<Path> compile_driver;
     std::vector<LazyPath> include_paths = {}; // -I
     std::vector<LazyPath> library_paths = {}; // -L
     std::vector<LazyPath> libraries = {}; // -l:
     std::vector<std::string> libraries_system = {}; // -l
     std::vector<Define> defines = {}; // -D
-    bool asan = true;
-    bool lto = false;
-    bool debug_info = true;
-    bool warnings = true;
-    Optimize optimize = Optimize::O1;
-    std::optional<CXXStandard> standard = std::nullopt;
+    std::optional<bool> warnings;
+    std::optional<Optimize> optimize;
+    std::optional<CXXStandard> standard;
     std::string extra_flags = "";
 };
 
-void fixupLinkObjFlags(Flags* link, Flags* obj) {
-    if (obj->asan) link->asan = true;
-    if (link->asan) obj->asan = true;
-    if (link->lto) obj->lto = true;
-    if (obj->lto) link->lto = true;
+struct CXXFlags {
+    Path compile_driver = "g++";
+    std::vector<LazyPath> include_paths = {}; // -I
+    std::vector<LazyPath> library_paths = {}; // -L
+    std::vector<LazyPath> libraries = {}; // -l:
+    std::vector<std::string> libraries_system = {}; // -l
+    std::vector<Define> defines = {}; // -D
+    bool warnings = true;
+    Optimize optimize = Optimize::O1;
+    CXXStandard standard = CXXStandard::CXX17;
+    std::string extra_flags = "";
+};
+
+inline CXXFlags applyFlagsOverlay(CXXFlags f1, const CXXFlagsOverlay* f2) {
+    if (f2->compile_driver.has_value()) f1.compile_driver = f2->compile_driver.value();
+    f1.include_paths.insert(f1.include_paths.end(), f2->include_paths.begin(), f2->include_paths.end());
+    f1.library_paths.insert(f1.library_paths.end(), f2->library_paths.begin(), f2->library_paths.end());
+    f1.libraries.insert(f1.libraries.end(), f2->libraries.begin(), f2->libraries.end());
+    f1.libraries_system.insert(f1.libraries_system.end(), f2->libraries_system.begin(), f2->libraries_system.end());
+    f1.defines.insert(f1.defines.end(), f2->defines.begin(), f2->defines.end());
+    if (f2->warnings.has_value()) f1.warnings = f2->warnings.value();
+    if (f2->optimize.has_value()) f1.optimize = f2->optimize.value();
+    if (f2->standard.has_value()) f1.standard = f2->standard.value();
+    if (!f2->extra_flags.empty()) {
+        if (!f1.extra_flags.empty()) f1.extra_flags += " ";
+        f1.extra_flags += f2->extra_flags;
+    }
+
+    return f1;
 }
 
+// flags that must be enabled for both obj and link steps to work properly
+struct LibOrExeCXXFlagsOverlay {
+    std::optional<bool> asan;
+    std::optional<bool> debug_info;
+    std::optional<bool> lto;
+};
+
+struct LibOrExeCXXFlags {
+    bool asan;
+    bool debug_info;
+    bool lto;
+};
+
 struct ObjOpts {
-    Flags flags;
+    CXXFlagsOverlay flags;
     Path source;
+
+    // if part of lib or exe, points to flags, related to whole lib/exe
+    // no need for user to provide it, it's filled automatically on addLib/addExe calls
+    // but for manual obj creation it may be useful
+    // must point to stable location inside of created Lib or Exe structure
+    LibOrExeCXXFlagsOverlay* opt_whole = nullptr;
 };
 
 struct Obj {
@@ -235,15 +296,16 @@ struct Obj {
     Step* step;
 };
 
-struct ExecutableOpts {
+struct ExeOpts {
     std::string name;
     std::string desc = "";
-    Flags obj = {};
-    Flags link = {};
+    CXXFlagsOverlay obj = {};
+    CXXFlagsOverlay link = {};
+    LibOrExeCXXFlagsOverlay exe_flags = {};
 };
 
 struct Exe {
-    ExecutableOpts opts;
+    ExeOpts opts;
     Step* link_step;
 
     // executable depends on other step, meaning that other step must be completed before building this exe
@@ -255,15 +317,12 @@ struct Exe {
     }
 };
 
-struct StaticLinkTool {
-    Path path;
-};
-
 struct LibraryOpts {
     std::string name;
     std::string desc = "";
-    Flags obj = {};
-    std::variant<Flags, StaticLinkTool> link;
+    CXXFlagsOverlay obj = {};
+    bool static_lib = true;
+    LibOrExeCXXFlagsOverlay lib_flags = {};
 };
 
 struct Lib {
@@ -279,7 +338,7 @@ struct Lib {
     }
 
     std::string libName() const {
-        if (std::holds_alternative<StaticLinkTool>(opts.link)) {
+        if (opts.static_lib) {
             return "lib" + opts.name + ".a";
         } else {
             return "lib" + opts.name + ".so";
@@ -295,6 +354,32 @@ struct RunOptions {
     std::vector<std::string> args = {}; // arguments to pass to the executable
 };
 
+struct SubProjOpts {
+    std::string name;
+    Dir dir;
+};
+
+struct SubProj {
+    SubProjOpts opts;
+    std::unique_ptr<Build> b; // initialized during build setup
+    void* configure_handle = nullptr; // handle to "dlopen-ed" library
+};
+
+inline bool hasFileInPath(std::string filename) {
+    auto* path_env = std::getenv("PATH");
+    if (!path_env) return false;
+    std::string path_env_str{path_env};
+    std::istringstream iss{path_env_str};
+    std::string token;
+    while (std::getline(iss, token, ':')) {
+        auto file_path = Path{token} / filename;
+        if (std::filesystem::exists(file_path) && std::filesystem::is_regular_file(file_path)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 inline Hash hashString(std::string_view str) {
     Hash hash{};
     for (char c : str) {
@@ -303,8 +388,8 @@ inline Hash hashString(std::string_view str) {
     return hash;
 }
 
-// cached inside of one run
-Hash hashFile(Path path) {
+// cached inside of one run. mark this function to be optimized even in debug mode
+inline Hash hashFile(Path path) {
     static std::mutex hash_mutex;
     static std::unordered_map<Path, Hash> hash_cache;
     {
@@ -315,20 +400,30 @@ Hash hashFile(Path path) {
     auto* fin = std::fopen(path.c_str(), "rb");
     if (!fin) panic("Failed to open file %s for hashing: %s\n", path.c_str(), strerror(errno));
 
-    auto hash = hashString(path.filename().string()); // bogus for empty files
+    Hash hash{}; // bogus for empty files
     std::array<char, 32 * 1024> buffer;
-    while (true) {
-        auto sz = std::fread(buffer.data(), 1, buffer.size(), fin);
-        if (sz == 0) break;
+    size_t buffer_size = 0;
+
+    auto process_buf = [&]() {
         // first hash as uint64_t
-        for (size_t i = 0; i < sz / sizeof(uint64_t); ++i) {
+        for (size_t i = 0; i < buffer_size / sizeof(uint64_t); ++i) {
             auto batch = reinterpret_cast<uint64_t*>(buffer.data())[i];
             hash = hash.combine(Hash{batch});
         }
         // handle remaining bytes
-        for (size_t i = (sz / sizeof(uint64_t)) * sizeof(uint64_t); i < sz; ++i) {
+        for (size_t i = (buffer_size / sizeof(uint64_t)) * sizeof(uint64_t); i < buffer_size; ++i) {
             hash = hash.combine(Hash{static_cast<uint64_t>(buffer[i])});
         }
+        buffer_size = 0;
+    };
+
+    while (!feof(fin)) {
+        buffer_size += std::fread(buffer.data() + buffer_size, 1, buffer.size() - buffer_size, fin);
+        if (buffer_size < buffer.size()) continue;
+        process_buf();
+    }
+    if (buffer_size > 0) {
+        process_buf();
     }
     std::fclose(fin);
 
@@ -339,10 +434,16 @@ Hash hashFile(Path path) {
 
 inline Hash hashDirRec(Dir dir) {
     Hash hash{};
+    std::vector<Path> entries;
     for (auto entry : std::filesystem::recursive_directory_iterator{dir}) {
         if (entry.is_regular_file()) {
-            hash = hash.combineUnordered(hashString(entry.path().string()).combine(hashFile(entry.path())));
+            entries.push_back(entry.path().lexically_relative(dir));
         }
+    }
+    std::sort(entries.begin(), entries.end());
+    for (const auto& rel : entries) {
+        auto full_path = dir / rel;
+        hash = hash.combineUnordered(hashString(rel.string()).combine(hashFile(full_path)));
     }
     return hash;
 }
@@ -351,7 +452,7 @@ inline Hash hashAny(Path path) {
     if (std::filesystem::is_directory(path)) {
         return hashDirRec(path);
     } else {
-        return hashFile(path);
+        return hashFile(path); // no filename mixing here
     }
 }
 
@@ -391,7 +492,7 @@ struct HasherOpts {
     std::vector<std::string> strings = {};
 };
 
-std::function<Hash(Hash)> inputsHasher(HasherOpts opts) {
+inline std::function<Hash(Hash)> inputsHasher(HasherOpts opts) {
     return [opts](Hash h) {
         h = h.combine(hashString(opts.stable_id));
         for (auto dir : opts.dirs) h = h.combine(hashDirRec(dir));
@@ -410,7 +511,7 @@ struct CompileCommandsEntry {
 using Clock = std::chrono::high_resolution_clock;
 using Timestamp = std::chrono::time_point<Clock>;
 
-void commandReplacePatternIfExist(std::string* cmd, std::string_view pattern, std::vector<Path> paths) {
+inline void commandReplacePatternIfExist(std::string* cmd, std::string_view pattern, std::vector<Path> paths) {
     if (auto pos = cmd->find(pattern); pos != std::string::npos) {
         std::string replacement;
         for (const auto& p : paths) {
@@ -445,66 +546,118 @@ private:
     std::list<Obj> objs;
     std::list<Exe> exes;
     std::list<Lib> libs;
+    std::list<SubProj> sub_builds;
     std::vector<std::pair<Step*, Path>> install_list;
-    Step* install_step = nullptr;
-    Step* build_all_step = nullptr;
     std::vector<CompileCommandsEntry> compile_commands_list;
 
-    Timestamp glob_start_time;
-    Timestamp build_phase_start;
-    bool build_phase_started = false;
+    bool build_phase_started = false; // for asserts
 public:
+    Step* install_step = nullptr;
+    Step* build_all_step = nullptr;
     Dir out;
     std::vector<std::string> cli_args;
-    std::optional<bool> dump_compile_commands;
+    bool dump_compile_commands = false;
     int max_parallel_jobs = -1;
 
-    Build(int argc, char** argv) {
-        glob_start_time = Clock::now();
+    std::optional<Path> static_link_tool; // if empty, static linking is not supported
+    CXXFlags global_flags = {};
+    LibOrExeCXXFlags global_lib_exe_flags = {};
 
-        std::error_code ec;
-        root = Path{argv[0]}.parent_path();
-        if (root.empty()) root = std::filesystem::current_path();
-        root = std::filesystem::canonical(root);
-        
-        auto env_cache = std::getenv("CACHE_PREFIX");
-        cache = Dir{env_cache ? env_cache : ".cache"}; 
-        cache = root / cache;
-        std::filesystem::create_directories(cache, ec);
-        cache = std::filesystem::canonical(cache);
-        
-        auto env_prefix = std::getenv("PREFIX");
-        out = Dir{env_prefix ? env_prefix : "build"};
-        out = root / out;
-        std::filesystem::create_directories(out, ec);
-        out = std::filesystem::canonical(out);
-
-        std::filesystem::create_directories(cache / "arts");
-        std::filesystem::create_directories(cache / "deps");
-        std::filesystem::remove_all(cache / "tmp", ec); // may fail
-        std::filesystem::create_directories(cache / "tmp"); // may not
-
-        // auto-gitignore areas we manage
-        writeEntireFile(cache / ".gitignore", "*");
-        writeEntireFile(out / ".gitignore", "*");
+    Build(int argc, char** argv, Path env_root, const char* env_cache, const char* env_prefix, CXXFlags global_flags) {
+        this->global_flags = global_flags;
 
         saved_argc = argc;
         saved_argv.resize(argc + 1);
         for (int i = 0; i < argc; ++i) saved_argv[i] = argv[i];
         saved_argv[argc] = nullptr;
 
-        checkIfBuildScriptChanged();
+        setupDirectories(env_root, env_cache, env_prefix);
+
+        detectStaticLinkTool();
+
+        // printf("buildpp: using root dir: %s\n", root.c_str());
+        // printf("buildpp: using cache dir: %s\n", cache.c_str());
+        // printf("buildpp: using output dir: %s\n", out.c_str());
+        // printf("buildpp: using static link tool: %s\n", static_link_tool.has_value() ? static_link_tool->c_str() : "<none>");
+        // printf("buildpp: using global compile driver: %s\n", global_flags.compile_driver.c_str());
+    }
+
+    void setupDirectories(Path env_root, const char* env_cache, const char* env_prefix) {
+        std::error_code ec;
+        root = env_root;
+        if (root.empty()) root = std::filesystem::current_path();
+        root = std::filesystem::canonical(root);
+
+        cache = Dir{env_cache ? env_cache : ".cache"}; 
+        cache = root / cache;
+        std::filesystem::create_directories(cache, ec);
+        cache = std::filesystem::canonical(cache);
+
+        out = Dir{env_prefix ? env_prefix : "build"};
+        out = root / out;
+        std::filesystem::create_directories(out, ec);
+        out = std::filesystem::canonical(out);
+
+        std::filesystem::create_directories(cache / "arts");
+        std::filesystem::remove_all(cache / "tmp", ec); // may fail
+        std::filesystem::create_directories(cache / "tmp"); // may not
+
+        // auto-gitignore areas we manage
+        writeEntireFile(cache / ".gitignore", "*");
+        writeEntireFile(out / ".gitignore", "*");
+    }
+
+    void detectStaticLinkTool() {
+        if (hasFileInPath("llvm-ar")) {
+            static_link_tool = Path{"llvm-ar"};
+        } else if (hasFileInPath("ar")) {
+            static_link_tool = Path{"ar"};
+        }
+    }
+
+    void preConfigure() {
         parseOldOptions();
         parseArgs(); // depends on old_options
 
-        install_step = addStep({.name = "install", .desc = "Install targets", .silent = false});
-        
-        build_all_step = addStep({.name = "build", .desc = "Build all targets", .silent = false});
-        build_all_step->deps.push_back(install_step);
+        // global install step merges together everything this project installs and packs it into one directory
+        install_step = addStep({.name = "install", .desc = "Install targets", .phony = true, .silent = true});
+        install_step->inputs_hash = inputsHasher({.stable_id = "install-all"});
+
+        build_all_step = addStep({.name = "build", .desc = "Build all targets", .silent = true});
+
+        // push one compile command for self-build
+        auto self_path = (root / "build.cpp").string();
+        auto cce = CompileCommandsEntry{
+            .command = std::string{BPP_RECOMPILE_SELF_CMD} + " " + self_path + " -DBPP_RECOMPILE_SELF_CMD='\"" + escapeStringBash(BPP_RECOMPILE_SELF_CMD) + "\"'",
+            .file = root / "build.cpp",
+            .dir = root,
+        };
+        compile_commands_list.push_back(cce);
+    }
+
+    void postConfigure() {
+        // create compile_commands list at the end of configuration to be more predictable for user
+        std::vector<Path> seen_sources;
+        for (const auto& obj : objs) {
+            // NOTE: In case user compiles same source into multiple objs with different flags, only first one is recorded and emited with no warnings
+            if (std::find(seen_sources.begin(), seen_sources.end(), root / obj.opts.source) != seen_sources.end()) continue; // already recorded
+            seen_sources.push_back(root / obj.opts.source);
+
+            auto comp_cmd = std::string{};
+            cmdRenderCompileObj(&comp_cmd, obj.opts, {obj.opts.source}, {}, "");
+            auto cce = CompileCommandsEntry{
+                .command = comp_cmd,
+                .file = root / obj.opts.source,
+                .dir = root,
+            };
+            compile_commands_list.push_back(cce);
+        }
+        if (dump_compile_commands) renderAndDumpCompileCommandsJson(root / "compile_commands.json");
     }
 
     template <typename T>
     std::optional<T> option(std::string key, std::string description = "No description") {
+        if (build_phase_started) panic("Cannot add new option \"%s\" after build phase has started\n", key.c_str());
         // check if the same option exists in old options
         if (options.count(key) == 0) { // we need to recompile self with new option
             Colorizer c{stdout};
@@ -547,8 +700,8 @@ public:
         }
     }
 
-    Exe* addExe(ExecutableOpts opts, std::vector<Path> sources = {}) {
-        fixupLinkObjFlags(&opts.link, &opts.obj);
+    Exe* addExe(ExeOpts opts, std::vector<Path> sources = {}) {
+        if (build_phase_started) panic("Cannot add new executable \"%s\" after build phase has started\n", opts.name.c_str());
 
         auto step = addStep({.name = opts.name, .desc = opts.desc});
         exes.push_back({.opts = opts, .link_step = step});
@@ -556,16 +709,14 @@ public:
         build_all_step->deps.push_back(step);
 
         for (auto src : sources) {
-            auto obj = addObj({.flags = opts.obj, .source = src}, true);
+            auto obj = addObj({.flags = opts.obj, .source = src, .opt_whole = &exe->opts.exe_flags}, true);
             step->inputs.push_back({.step = obj->step});
         }
 
-        step->inputs_hash = [this, exe](Hash h) {
-            return h.combine(hashFlags(exe->opts.link));
-        };
+        step->inputs_hash = [this, exe](Hash h) { return h.combine(hashExeOpts(exe->opts)); };
         step->action = [this, exe](Output out) {
             std::string cmd;
-            cmdRenderCompile(&cmd, exe->opts.link, {}, completedInputs(exe->link_step), out);
+            cmdRenderLinkExe(&cmd, exe->opts, completedInputs(exe->link_step), out);
             if (verbose) log("Linking exe cmd: %s\n", cmd.c_str());
             int res = std::system(cmd.c_str());
             if (res != 0) panic("Link step command failed with code %d", res);
@@ -575,6 +726,7 @@ public:
     }
 
     Lib* addLib(LibraryOpts opts, std::vector<Path> sources = {}) {
+        if (build_phase_started) panic("Cannot add new library \"%s\" after build phase has started\n", opts.name.c_str());
         auto step = addStep({.name = opts.name, .desc = opts.desc});
         build_all_step->deps.push_back(step);
         libs.push_back({.opts = opts, .link_step = step});
@@ -586,34 +738,10 @@ public:
             step->inputs.push_back({.step = obj->step});
         }
 
-        step->inputs_hash = [this, lib](Hash h) {
-            if (auto link_flags = std::get_if<Flags>(&lib->opts.link)) {
-                h = h.combine(hashFlags(*link_flags)); // shared-lib
-            }
-            if (auto static_link = std::get_if<StaticLinkTool>(&lib->opts.link)) {
-                h = h.combine(hashString(static_link->path.string())); // static-lib
-            }
-            return h;
-        };
+        step->inputs_hash = [this, lib](Hash h) { return h.combine(hashLibOpts(lib->opts)); };
         step->action = [this, lib](Output out) {
-            auto link = lib->opts.link;
-            auto obj = lib->opts.obj;
-            if (auto link_flags = std::get_if<Flags>(&link)) fixupLinkObjFlags(link_flags, &obj);
-            auto inputs = completedInputs(lib->link_step);
             std::string cmd;
-            if (auto static_link = std::get_if<StaticLinkTool>(&link)) { // static
-                cmd += static_link->path.string();
-                cmd += " rsc";
-                cmd += " " + out.string();
-                for (auto in : inputs) {
-                    cmd += " " + in.string();
-                }
-            }
-            if (auto link_flags = std::get_if<Flags>(&link)) { // shared
-                auto flags = *link_flags;
-                flags.extra_flags += " -shared";
-                cmdRenderCompile(&cmd, flags, {}, inputs, out);
-            }
+            cmdRenderLinkLib(&cmd, lib->opts, completedInputs(lib->link_step), out);
             if (verbose) log("Linking lib cmd: %s\n", cmd.c_str());
             int res = std::system(cmd.c_str());
             if (res != 0) panic("Link step command failed with code %d", res);
@@ -624,8 +752,9 @@ public:
 
     // adds file, wrapped as step. to be used later in some step inputs
     LazyPath addFile(Path src) {
-        src = root / src;
+        if (build_phase_started) panic("Cannot add new file \"%s\" after build phase has started\n", src.c_str());
         auto file_step = addStep({.name = "file-" + src.string(), .desc = "File " + src.string(), .silent = true});
+        src = root / src; // canonicalize after nice name generation
         file_step->inputs_hash = [this, src](Hash) { return hashFile(src); };
         file_step->action = [this, src](Output out) {
             std::error_code ec;
@@ -637,13 +766,14 @@ public:
 
     // step must compile one object file from source
     Obj* addObj(ObjOpts opts, bool silent = false) {
+        if (build_phase_started) panic("Cannot add new object file \"%s\" after build phase has started\n", opts.source.c_str());
         auto step = addStep({
             .name = Path{opts.source}.replace_extension("o").string(),
             .desc = "Object file for " + Path{opts.source}.filename().string(),
             .silent = silent
         });
+        opts.source = root / opts.source; // make source absolute for cases when build script is run from other dir
         build_all_step->deps.push_back(step);
-        step->inputs.push_back(addFile(opts.source));
 
         objs.push_back({opts, step});
         auto obj = &objs.back();
@@ -652,16 +782,15 @@ public:
             auto inputs = completedInputs(obj->step);
             h = h.combine(hashString(obj->opts.source.string()));
             h = h.combine(hashFile(obj->opts.source));
-            h = h.combine(hashFlags(obj->opts.flags));
-            Hash src_h = buildEntireSourceFileHashCached(obj->opts.flags, obj->opts.source);
+            h = h.combine(hashObjOpts(obj->opts));
+            Hash src_h = buildEntireSourceFileHashCached(obj->opts, obj->opts.source);
             h = h.combine(src_h);
             return h;
         };
         step->action = [this, obj](Output out) mutable { // action is invoked when step must be performed
             std::string cmd;
             auto flags = obj->opts.flags;
-            flags.extra_flags += " -c"; // compiling to just object file
-            cmdRenderCompile(&cmd, flags, {obj->opts.source}, {}, out); // inputs 
+            cmdRenderCompileObj(&cmd, obj->opts, {obj->opts.source}, {}, out); // inputs 
             if (verbose) blog("Compile Obj command: %s\n", cmd.data());
 
             auto ret = std::system(cmd.data());
@@ -671,7 +800,14 @@ public:
         return obj;
     }
 
-    Step* addRun(Exe* exe, RunOptions opts) {
+    Step* addRun(std::string name, std::string desc) {
+        auto step = addStep({.name = name, .desc = desc, .phony = true, .silent = false});
+        step->inputs_hash = inputsHasher({.stable_id = "Run " + name});
+        return step;
+    }
+
+    Step* addRunExe(Exe* exe, RunOptions opts) {
+        if (build_phase_started) panic("Cannot add new run step \"%s\" after build phase has started\n", opts.name.c_str());
         auto run = addStep({.name = opts.name, .desc = opts.desc, .phony = true, .silent = false});
         runs.push_back({opts, run});
         run->inputs.push_back({.step = exe->link_step});
@@ -696,86 +832,130 @@ public:
         return run;
     }
 
-    Step* installExe(Exe* exe, Path dest) {
-        return install(exe->link_step, "bin" / dest);
+    Step* installExe(Exe* exe) {
+        return install(exe->link_step, Path{"bin"} / exe->opts.name);
     }
 
-    Step* installLib(Lib* lib, Path dest) {
-        return install(lib->link_step, "lib" / dest);
+    Step* installLib(Lib* lib) {
+        return install(lib->link_step, Path{"lib"} / lib->libName());
+    }
+
+    struct InstallHeaderOpts {
+        Path prefix = "";
+        bool as_tree = true;
+    };
+
+    void installHeaders(std::vector<Path> headers, InstallHeaderOpts opts) {
+        for (auto h : headers) {
+            using co = std::filesystem::copy_options;
+            auto to = out / "include" / opts.prefix / ((opts.as_tree) ? h : h.filename());
+            std::filesystem::create_directories(to.parent_path());
+            std::filesystem::copy(root / h, to, co::overwrite_existing);
+        }
     }
 
     Step* install(Step* step, Path dst) {
-        auto file_install_step = addStep({.name = "install-" + step->opts.name, .desc = "Installs " + step->opts.name, .silent = false});
-        file_install_step->inputs.push_back({.step = step});
-        install_step->deps.push_back(file_install_step);
-        file_install_step->inputs_hash = [=](Hash h) {
-            auto src = cacheEntryOfStep(step);
-            // check if destination file exists and equals to target artifact
-            if (!std::filesystem::exists(dst)) return Hash{step->hash->value + 1}; // bogus hash
-            auto dst_h = hashAny(dst);
-            auto src_h = hashAny(src);
-            return dst_h.value == src_h.value ? h : Hash{step->hash->value + 1}; // bogus hash
-        };
-        file_install_step->action = [=](Output) {
-            if (file_install_step->inputs.size() != 1) panic("Install step invoked with %lu files instead of 1\n", file_install_step->inputs.size());
-            blog("[%s] target %s -> %s\n", file_install_step->opts.name.c_str(), step->opts.name.c_str(), (out / dst).c_str());
-            // copy file from artifact cache to dest.path
-            // but first ensure parent directory exists
+        if (build_phase_started) panic("Cannot add new install step \"%s\" after build phase has started\n", step->opts.name.c_str());
+        auto istep = addStep({.name = "install-" + step->opts.name, .desc = "Installs " + step->opts.name, .silent = true});
+        dst = out / dst;
+        istep->inputs.push_back({.step = step});
+        install_step->inputs.push_back({.step = istep});
+        istep->inputs_hash = inputsHasher({.stable_id = istep->opts.name, .strings = {dst.string()}});
+        istep->action = [=](Output) mutable {
+            if (verbose) blog("Installing step %s output to path %s\n", step->opts.name.c_str(), dst.string().c_str());
             std::filesystem::create_directories((out / dst).parent_path());
             using co = std::filesystem::copy_options;
-            std::filesystem::copy(cacheEntryOfStep(step), out / dst, co::recursive | co::overwrite_existing);
+            std::filesystem::copy(completedInputs(istep).at(0), out / dst, co::recursive | co::overwrite_existing);
         };
-        return file_install_step;
+        return istep;
     }
 
     Step* addStep(Step::Options opts) {
-        steps.push_back(Step{ .opts = opts, .idx = steps.size() });
+        if (build_phase_started) panic("Cannot add new step \"%s\" after build phase has started\n", opts.name.c_str());
+        steps.emplace_back();
+        steps.back().opts = opts;
         return &steps.back();
     }
 
     // requires system to have curl+tar
-    Step* fetchTarball(std::string name, Url url, Hash expected_hash) {
+    Step* fetchByUrl(std::string name, Url url, Hash expected_hash) {
+        if (build_phase_started) panic("Cannot add new step \"%s\" after build phase has started\n", name.c_str());
         auto step = addStep({.name = name, .desc = "", .silent = false});
         step->inputs_hash = [this, url, expected_hash](Hash) { return expected_hash; };
         step->action = [=](Output out) {
             // download tarball from url to tmp path
-            auto tar_tmp = newTmpPath();
-            std::filesystem::create_directories(tar_tmp.parent_path());
-            std::string cmd = "curl -L \"" + url.value + "\" -o \"" + tar_tmp.string() + "\"";
-            if (verbose) blog("Downloading tarball cmd: %s\n", cmd.c_str());
+            std::string cmd = "curl --silent -L \"" + url.value + "\" -o \"" + out.string() + "\"";
+            if (verbose) blog("Fetching using cmd: %s\n", cmd.c_str());
             int res = std::system(cmd.c_str());
             if (res != 0) panic("Failed to download tarball %s from %s\n", name.c_str(), url.value.c_str());
 
-            // unpack tarball exactly to other tmp directory
-            auto untar_tmp = newTmpPath();
-            std::filesystem::create_directories(untar_tmp);
-            cmd = "tar -xf \"" + tar_tmp.string() + "\" -C \"" + untar_tmp.string() + "\" --strip-components=1";
-            if (verbose) blog("Unpacking tarball cmd: %s\n", cmd.c_str());
-            res = std::system(cmd.c_str());
-            if (res != 0) panic("Failed to unpack tarball %s from %s\n", name.c_str(), url.value.c_str());
-
             // verify hash of unpacked tarball
-            auto actual_hash = hashAny(untar_tmp);
+            auto actual_hash = hashAny(out);
             if (actual_hash.value != expected_hash.value) {
                 log("Expected hash: %llu\n", expected_hash.value);
                 log("Actual   hash: %llu\n", actual_hash.value);
-                log("Tarball: %s\n", tar_tmp.string().c_str());
-                log("Directory: %s\n", untar_tmp.string().c_str());
-                panic("Hash mismatch for downloaded tarball %s from %s: expected %llu but got %llu\n",
+                log("Downloaded path: %s\n", out.string().c_str());
+                panic("Hash mismatch for fetched content of step %s from url %s: expected %llu but got %llu\n",
                       name.c_str(), url.value.c_str(), expected_hash.value, actual_hash.value);
             }
-
-            // all good, move unpacked to out
-            std::error_code ec;
-            std::filesystem::rename(untar_tmp, out, ec);
-            log("Fetched and unpacked tarball %s to %s\n", name.c_str(), out.string().c_str());
-            if (ec) panic("Failed to move unpacked tarball %s to %s: %s\n", name.c_str(), out.string().c_str(), ec.message().c_str());
         };
         return step;
     }
 
+    Step* unpackTar(std::string name, Step* tarball_step) {
+        if (build_phase_started) panic("Cannot add new step \"%s\" after build phase has started\n", name.c_str());
+        auto unpack_step = addStep({.name = name, .desc = "Unpack tarball " + tarball_step->opts.name, .silent = false});
+        unpack_step->inputs.push_back({.step = tarball_step});
+        unpack_step->inputs_hash = inputsHasher({
+            .stable_id = "unpack-tar-" + tarball_step->opts.name,
+        });
+        unpack_step->action = [=](Output out) {
+            std::filesystem::create_directories(out);
+            auto tarball_path = completedInputs(unpack_step).at(0);
+            std::string cmd = "tar -xf \"" + tarball_path.string() + "\" -C \"" + out.string() + "\" --strip-components=1";
+            if (verbose) blog("Unpacking tar cmd: %s\n", cmd.c_str());
+            int res = std::system(cmd.c_str());
+            if (res != 0) panic("Failed to unpack tarball in step %s\n", tarball_step->opts.name.c_str());
+        };
+        return unpack_step;
+    }
+
+    Step* runCMake(Step* sources, std::string build_target, std::vector<std::string> cmake_args = {}) {
+        if (build_phase_started) panic("Cannot add new step \"%s\" after build phase has started\n", sources->opts.name.c_str());
+        auto step = addStep({.name = sources->opts.name + "-cmake", .desc = "CMake run over " + sources->opts.name, .silent = false});
+        step->inputs.push_back({.step = sources});
+        step->inputs_hash = inputsHasher({.stable_id = "cmake-" + sources->opts.name, .strings = cmake_args});
+        step->action = [=](Output out) {
+            std::string cmd;
+            int res;
+            auto src_dir = completedInputs(step).at(0);
+            auto build_dir = newTmpPath();
+            std::filesystem::create_directories(out);
+            std::filesystem::create_directories(build_dir);
+
+            cmd = "cmake -S \"" + src_dir.string() + "\" -B \"" + build_dir.string() + "\"";
+            for (auto arg : cmake_args) cmd += " \"" + arg + "\" ";
+            if (verbose) blog("CMake configure cmd: %s\n", cmd.c_str());
+            res = std::system(cmd.c_str());
+            if (res != 0) panic("Failed to configure CMake project %s\n", sources->opts.name.c_str());
+
+            cmd = "cmake --build \"" + build_dir.string() + "\" --target " + build_target + " -j" + std::to_string(max_parallel_jobs);
+            if (verbose) blog("CMake build cmd: %s\n", cmd.c_str());
+            res = std::system(cmd.c_str());
+            if (res != 0) panic("Failed to build CMake project %s\n", sources->opts.name.c_str());
+
+            cmd = "cmake --install \"" + build_dir.string() + "\" --prefix \"" + out.string() + "\"";
+            if (verbose) blog("CMake install cmd: %s\n", cmd.c_str());
+            res = std::system(cmd.c_str());
+            if (res != 0) panic("Failed to install CMake project %s\n", sources->opts.name.c_str());
+        };
+
+        return step;
+    }
+
     Step* cmakeFromTarballUrl(std::string name, Url url, Hash expected_hash, std::vector<std::string> cmake_args = {}) {
-        auto fetch_step = fetchTarball(name + "-fetch", url, expected_hash);
+        if (build_phase_started) panic("Cannot add new step \"%s\" after build phase has started\n", name.c_str());
+        auto fetch_step = fetchByUrl(name + "-fetch", url, expected_hash);
         auto cmake_step = addStep({.name = name + "-cmake", .desc = "CMake configure-build " + name, .silent = false});
         cmake_step->inputs.push_back({.step = fetch_step});
         cmake_step->inputs_hash = inputsHasher({
@@ -803,6 +983,66 @@ public:
         return cmake_step;
     }
 
+    // will compile build.cpp of subproject and return Build object to operate on it
+    SubProj* addSubproject(std::string name, Dir d) {
+        if (build_phase_started) panic("Cannot add new step \"%s\" after build phase has started\n", name.c_str());
+        d = root / d;
+        auto src = d / "build.cpp";
+        if (!std::filesystem::exists(src)) panic("Subproject directory %s does not contain build.cpp\n", d.c_str());
+
+        // first, compile and cache buildpp binary for subproject
+        auto sub_buildpp_path = cache / "tmp" / ("buildpp-subproj-" + name);
+        auto hash = buildEntireSourceFileHashCached({.flags = {.compile_driver = BPP_RECOMPILE_SELF_CMD}}, src);
+        if (!cacheEntryExists(hash)) {
+            blog("Compiling build script for subproject %s\n", name.c_str());
+            // build shared library for buildpp
+            std::string cmd;
+            cmd += BPP_RECOMPILE_SELF_CMD;
+            cmd += " -shared -fPIC";
+            cmd += " -o \"" + sub_buildpp_path.string() + "\"";
+            cmd += " \"" + src.string() + "\"";
+            if (verbose) blog("Subproject buildpp compile cmd: %s\n", cmd.c_str());
+            int res = std::system(cmd.c_str());
+            if (res != 0) panic("Failed to compile buildpp for subproject %s\n", name.c_str());
+            cacheEntryMoveFromTmp(hash, sub_buildpp_path);
+        }
+
+        auto lib = cacheEntryGetPath(hash);
+        sub_builds.push_back({.opts = {.name = name, .dir = d}});
+        auto subproj = &sub_builds.back();
+        subproj->b = std::make_unique<Build>(saved_argc, saved_argv.data(), d, cache.c_str(), (out / name).c_str(), global_flags);
+
+        // load library, let it live forever
+        subproj->configure_handle = dlopen(lib.c_str(), RTLD_LAZY | RTLD_LOCAL);
+        if (!subproj->configure_handle) panic("Failed to dlopen buildpp subproject library %s: %s\n", lib.c_str(), dlerror());
+        using ConfF = void (*)(Build*);
+        auto configure_fn = (ConfF)dlsym(subproj->configure_handle, "configure_stable");
+        if (!configure_fn) panic("Failed to find symbol \"configure_stable\" in subproject library %s: %s\n", lib.c_str(), dlerror());
+        subproj->b->preConfigure();
+        configure_fn(subproj->b.get());
+        subproj->b->dump_compile_commands = false; // force-disable compile commands dump for subprojects
+        subproj->b->postConfigure();
+        subproj->b->build_phase_started = true; // prevent further configuration
+        for (auto cce : subproj->b->compile_commands_list) compile_commands_list.push_back(cce); // just copy them
+        return subproj;
+    }
+
+    std::unordered_map<std::string, Exe*> allExes() {
+        std::unordered_map<std::string, Exe*> res;
+        for (auto& exe : exes) {
+            res[exe.opts.name] = &exe;
+        }
+        return res;
+    }
+
+    std::unordered_map<std::string, Lib*> allLibs() {
+        std::unordered_map<std::string, Lib*> res;
+        for (auto& lib : libs) {
+            res[lib.opts.name] = &lib;
+        }
+        return res;
+    }
+
     // you should not call it on your own
     void runBuild() {
         if (build_phase_started) panic("Build phase already started. Do NOT call runBuildPhase() multiple times\n");
@@ -811,17 +1051,16 @@ public:
             reportHelp();
             return;
         }
-        if (dump_compile_commands) generateCompileCommandsJson(root / "compile_commands.json");
 
         std::vector<Step*> all_steps_flat;
         for (auto& step : steps) all_steps_flat.push_back(&step);
         // perform requested steps in order
-        std::vector<size_t> steps_to_perform;
+        std::vector<Step*> steps_to_perform;
         for (const auto& step_name : requested_steps) {
             bool found = false;
             for (auto& step : steps) {
                 if (step.opts.name == step_name) {
-                    steps_to_perform.push_back(step.idx);
+                    steps_to_perform.push_back(&step);
                     found = true;
                 }
             }
@@ -830,51 +1069,49 @@ public:
 
         std::vector<Step*> steps_run_order; // popped from back
         enum Color {
-            White,
+            White = 0,
             Gray,
             Black,
         };
-        std::vector<Color> step_visited(steps.size(), White);
+        std::unordered_map<Step*, Color> step_visited;
         std::vector<Step*> gray_stack;
-        std::function<void(size_t)> visit = [&](size_t pos) {
-            if (step_visited[pos] == Black) return;
-            if (step_visited[pos] == Gray) {
+        std::function<void(Step*)> visit = [&](Step* cur) {
+            if (step_visited[cur] == Black) return;
+            if (step_visited[cur] == Gray) {
                 std::stringstream cycle;
                 cycle << "Cyclic dependency in build graph: ";
-                cycle << all_steps_flat[pos]->opts.name << " -> ";
+                cycle << cur->opts.name << " -> ";
                 auto it = gray_stack.rbegin();
                 while (it != gray_stack.rend()) {
                     cycle << (*it)->opts.name;
-                    if ((*it)->idx == pos) break;
+                    if ((*it) == cur) break;
                     cycle << " -> ";
                     it++;
                 }
                 panic("%s\n", cycle.str().c_str());
             }
-            step_visited[pos] = Gray;
-            gray_stack.push_back(all_steps_flat[pos]);
-            for (auto* dep : all_steps_flat[pos]->deps) {
-                visit(dep->idx);
+            step_visited[cur] = Gray;
+            gray_stack.push_back(cur);
+            for (auto* dep : cur->deps) {
+                visit(dep);
             }
 
-            for (auto dep : all_steps_flat[pos]->inputs) {
+            for (auto dep : cur->inputs) {
                 if (!dep.step) continue;
-                visit(dep.step->idx);
+                visit(dep.step);
             }
-            steps_run_order.push_back(all_steps_flat[pos]);
-            step_visited[pos] = Black;
+            steps_run_order.push_back(cur);
+            step_visited[cur] = Black;
             gray_stack.pop_back();
         };
 
         for (size_t i = 0; i < steps_to_perform.size(); i++) {
-            visit(steps_to_perform[steps_to_perform.size() - i - 1]);
+            visit(steps_to_perform[i]);
         }
 
         for (size_t i = 0; i < steps_run_order.size() / 2; ++i) {
             std::swap(steps_run_order[i], steps_run_order[steps_run_order.size() - i - 1]);
         }
-
-        build_phase_start = Clock::now();
 
         std::mutex queue_mutex;
         std::vector<std::thread> worker_threads;
@@ -890,15 +1127,11 @@ public:
                             steps_run_order.pop_back();
                         }
                         for (auto dep : step->deps) {
-                            while (!dep->completed()) {
-                                std::this_thread::sleep_for(std::chrono::milliseconds(16)); // TODO: Condvar
-                            }
+                            dep->waitUntilCompleted();
                         }
                         for (auto dep : step->inputs) {
                             if (!dep.step) continue;
-                            while (!dep.step->completed()) {
-                                std::this_thread::sleep_for(std::chrono::milliseconds(16)); // TODO: Condvar
-                            }
+                            dep.step->waitUntilCompleted();
                         }
 
                         performStepIfNeeded(step);
@@ -912,22 +1145,13 @@ public:
         for (auto& thread : worker_threads) {
             thread.join();
         }
-
-        auto build_phase_end = Clock::now();
-
-        auto configure_time = std::chrono::duration_cast<std::chrono::milliseconds>(build_phase_start - glob_start_time).count();
-        auto build_time = std::chrono::duration_cast<std::chrono::milliseconds>(build_phase_end - build_phase_start).count();
-        if (verbose) {
-            Colorizer c{stdout};
-            blog("Build took %s%.2fs%s\n", c.yellow(), (configure_time + build_time) / 1000.0, c.reset());
-        }
     }
 
     std::vector<Path> completedInputs(Step* step) {
         if (!build_phase_started) panic("completedInputs(step) is available only inside of step action that is executed after build phase started\n");
         std::vector<Path> res;
         for (auto input : step->inputs) {
-            if (!input.step->completed()) panic("Input step %s of step %s is not completed before dependant\n", input.step->opts.name.c_str(), step->opts.name.c_str());
+            if (!input.step->threadSafeIsCompleted()) panic("Input step %s of step %s is not completed before dependant\n", input.step->opts.name.c_str(), step->opts.name.c_str());
             res.push_back(resolveLazyPath(input));
         }
         return res;
@@ -946,8 +1170,20 @@ public:
         }
     }
 
+    void recompileBuildScriptIfChanged() {
+        auto new_hash = buildEntireSourceFileHashCached({.flags = {.compile_driver = BPP_RECOMPILE_SELF_CMD}}, root / "build.cpp");
+        // this if helps avoid rebuilding tool if cache is purged completely
+        std::ifstream hash_file{selfHashPath()};
+        if (!hash_file.is_open()) recompileSelf(new_hash, "build tool hash file missing, can't verify self-consistency");
+        Hash old_hash{0};
+        hash_file >> old_hash.value;
+        hash_file.close();
+        if (old_hash.value != new_hash.value) recompileSelf(new_hash, "source hashes differ");
+    }
+
 private:
-    void cmdRenderCompile(std::string* cmd, Flags flags, std::vector<Path> sources, std::vector<Path> inputs, Path out) {
+    void cmdRenderCXXFlags(std::string* cmd, CXXFlagsOverlay flags_overlay) {
+        auto flags = applyFlagsOverlay(global_flags, &flags_overlay);
         *cmd += flags.compile_driver;
         *cmd += " " + flags.extra_flags;
         for (const auto& def : flags.defines) {
@@ -957,38 +1193,79 @@ private:
             }
         }
         if (!flags.warnings) *cmd += " -w";
-        if (flags.debug_info) *cmd += " -g";
-        if (flags.asan) *cmd += " -fsanitize=address";
-        if (flags.lto) *cmd += " -flto";
         switch (flags.optimize) {
+            case Optimize::Default: break;
             case Optimize::O0: *cmd += " -O0"; break;
             case Optimize::O1: *cmd += " -O1"; break;
             case Optimize::O2: *cmd += " -O2"; break;
             case Optimize::O3: *cmd += " -O3"; break;
             case Optimize::Fast: *cmd += " -Ofast"; break;
         }
-        if (flags.standard.has_value()) {
-            switch (flags.standard.value()) {
-                case CXXStandard::CXX11: *cmd += " -std=c++11"; break;
-                case CXXStandard::CXX14: *cmd += " -std=c++14"; break;
-                case CXXStandard::CXX17: *cmd += " -std=c++17"; break;
-                case CXXStandard::CXX20: *cmd += " -std=c++20"; break;
-                case CXXStandard::CXX23: *cmd += " -std=c++23"; break;
-            }
+        switch (flags.standard) {
+            case CXXStandard::Default: break;
+            case CXXStandard::CXX11: *cmd += " -std=c++11"; break;
+            case CXXStandard::CXX14: *cmd += " -std=c++14"; break;
+            case CXXStandard::CXX17: *cmd += " -std=c++17"; break;
+            case CXXStandard::CXX20: *cmd += " -std=c++20"; break;
+            case CXXStandard::CXX23: *cmd += " -std=c++23"; break;
         }
         for (const auto& inc : flags.include_paths) *cmd += " -I" + resolveLazyPath(inc).string();
         for (const auto& lib_path : flags.library_paths) *cmd += " -L" + resolveLazyPath(lib_path).string();
-        for (auto src : sources) *cmd += " \"" + escapeStringJSON(src.string()) + "\"";
+    }
 
-        for (auto in : inputs) *cmd += " \"" + escapeStringJSON(in.string()) + "\"";
-
+    void cmdRenderCXXLibs(std::string* cmd, CXXFlagsOverlay flags_overlay) {
+        auto flags = applyFlagsOverlay(global_flags, &flags_overlay);
         for (const auto& lib : flags.libraries) *cmd += " -l:" + resolveLazyPath(lib).string();
         for (const auto& lib : flags.libraries_system) *cmd += " -l" + lib;
+    }
 
+    void cmdRenderWholeObjOpts(std::string* cmd, const LibOrExeCXXFlagsOverlay* whole) {
+        if (!whole) return;
+        if (whole->debug_info.value_or(global_lib_exe_flags.debug_info)) *cmd += " -g";
+        if (whole->asan.value_or(global_lib_exe_flags.asan)) *cmd += " -fsanitize=address";
+        if (whole->lto.value_or(global_lib_exe_flags.lto)) *cmd += " -flto";
+    }
+
+    void cmdRenderCompileObj(std::string* cmd, ObjOpts obj, std::vector<Path> sources, std::vector<Path> inputs, Path out) {
+        cmdRenderCXXFlags(cmd, obj.flags);
+        cmdRenderWholeObjOpts(cmd, obj.opt_whole);
+
+        *cmd += " -c";
+        
+        for (auto src : sources) *cmd += " \"" + escapeStringJSON(src.string()) + "\"";
+        for (auto in : inputs) *cmd += " \"" + escapeStringJSON(in.string()) + "\"";
+        cmdRenderCXXLibs(cmd, obj.flags);
         if (!out.empty()) *cmd += " -o " + out.string();
     }
 
-    inline Hash hashFlags(const Flags& flags) {
+    void cmdRenderLinkExe(std::string* cmd, ExeOpts exe, std::vector<Path> inputs, Path out) {
+        cmdRenderCXXFlags(cmd, exe.link);
+        cmdRenderWholeObjOpts(cmd, &exe.exe_flags);
+
+        for (auto in : inputs) *cmd += " \"" + escapeStringJSON(in.string()) + "\"";
+        cmdRenderCXXLibs(cmd, exe.link);
+        if (!out.empty()) *cmd += " -o " + out.string();
+    }
+
+    void cmdRenderLinkLib(std::string* cmd, LibraryOpts lib, std::vector<Path> inputs, Path out) {
+        if (lib.static_lib) { // static
+            if (!this->static_link_tool) panic("Static linking requested but no static link tool configured in Build object\n");
+            *cmd += static_link_tool->string();
+            *cmd += " rsc";
+            *cmd += " " + out.string();
+            for (auto in : inputs) *cmd += " \"" + escapeStringJSON(in.string()) + "\"";
+        } else {
+            cmdRenderCXXFlags(cmd, lib.obj);
+            cmdRenderWholeObjOpts(cmd, &lib.lib_flags);
+            *cmd += " -shared";
+            for (auto in : inputs) *cmd += " \"" + escapeStringJSON(in.string()) + "\"";
+            cmdRenderCXXLibs(cmd, lib.obj);
+            if (!out.empty()) *cmd += " -o " + out.string();
+        }
+    }
+
+    Hash hashCXXFlags(const CXXFlagsOverlay& flags_overlay) {
+        auto flags = applyFlagsOverlay(global_flags, &flags_overlay);
         Hash hash{};
         for (const auto& def : flags.defines) {
             hash = hash.combine(hashString(def.name));
@@ -1007,13 +1284,43 @@ private:
             hash = hash.combine(hashString(lib));
         }
         hash = hash.combine(hashString(flags.extra_flags));
-        hash = hash.combine(Hash{static_cast<uint64_t>(flags.asan)});
-        hash = hash.combine(Hash{static_cast<uint64_t>(flags.lto)});
-        hash = hash.combine(Hash{static_cast<uint64_t>(flags.debug_info)});
         hash = hash.combine(Hash{static_cast<uint64_t>(flags.optimize)});
         hash = hash.combine(Hash{static_cast<uint64_t>(flags.warnings)});
-        if (flags.standard.has_value()) hash = hash.combine(Hash{static_cast<uint64_t>(flags.standard.value())});
+        hash = hash.combine(Hash{static_cast<uint64_t>(flags.standard)});
         return hash;
+    }
+
+    Hash hashWholeObjOpts(const LibOrExeCXXFlagsOverlay* opts) {
+        if (!opts) return Hash{0};
+        Hash h{};
+        h = h.combine(Hash{static_cast<uint64_t>(opts->debug_info.value_or(global_lib_exe_flags.debug_info))});
+        h = h.combine(Hash{static_cast<uint64_t>(opts->asan.value_or(global_lib_exe_flags.asan))});
+        h = h.combine(Hash{static_cast<uint64_t>(opts->lto.value_or(global_lib_exe_flags.lto))});
+        return h;
+    }
+
+    Hash hashObjOpts(const ObjOpts& opts) {
+        auto h = hashCXXFlags(opts.flags);
+        h = h.combine(hashString(opts.source.string()));
+        h = h.combine(hashWholeObjOpts(opts.opt_whole));
+        return h;
+    }
+
+    Hash hashExeOpts(const ExeOpts& opts) {
+        auto h = hashCXXFlags(opts.link);
+        h = h.combine(hashWholeObjOpts(&opts.exe_flags));
+        h = h.combine(hashString(opts.name));
+        h = h.combine(hashString(opts.desc));
+        return h;
+    }
+
+    Hash hashLibOpts(const LibraryOpts& opts) {
+        auto h = hashCXXFlags(opts.obj);
+        h = h.combine(hashWholeObjOpts(&opts.lib_flags));
+        h = h.combine(hashString(opts.name));
+        h = h.combine(hashString(opts.desc));
+        h = h.combine(Hash{static_cast<uint64_t>(opts.static_lib)});
+        return h;
     }
 
     Path resolveLazyPath(LazyPath lp) {
@@ -1057,13 +1364,7 @@ private:
         if (!libs.empty()) {
             log("%s%sLibraries:%s\n", c.cyan(), c.bold(), c.reset());
             for (const auto& lib : libs) {
-                std::string info = "";
-                if (std::holds_alternative<Flags>(lib.opts.link)) {
-                    info = "(shared)";
-                } else if (std::holds_alternative<StaticLinkTool>(lib.opts.link)) {
-                    info = "(static)";
-                }
-
+                std::string info = lib.opts.static_lib ? "(static)" : "(shared)";
                 info += " (obj: " + std::to_string(lib.link_step->inputs.size()) + ")";
                 log("%s  %s%s :: %s %s%s%s\n", c.bold(), lib.opts.name.c_str(), c.reset(), lib.opts.desc.c_str(), c.gray(), info.c_str(), c.reset());
             }
@@ -1101,27 +1402,11 @@ private:
         return RecordTimeGuard{total_time_us};
     }
 
-    void generateCompileCommandsJson(Path out) {
+    void renderAndDumpCompileCommandsJson(Path out) {
         // walk targets, prep json
         std::vector<std::string> cmds;
 
-        auto self_path = (root / "build.cpp").string();
-        auto build_self_cmd = std::string{};
-        build_self_cmd += "  {\n";
-        build_self_cmd += "    \"command\":\"" + std::string{BPP_RECOMPILE_SELF_CMD} + " " + self_path + "\""; build_self_cmd += ",\n";
-        build_self_cmd += "    \"file\":\"" + self_path + "\""; build_self_cmd += ",\n";
-        build_self_cmd += "    \"directory\":\"" + root.string() + "\"\n";
-        build_self_cmd += "  }";
-        cmds.push_back(build_self_cmd);
-
-        for (const auto& obj : objs) {
-            auto comp_cmd = std::string{};
-            cmdRenderCompile(&comp_cmd, obj.opts.flags, {obj.opts.source}, {}, "");
-            auto cce = CompileCommandsEntry{
-                .command = comp_cmd,
-                .file = root / obj.opts.source,
-                .dir = root,
-            };
+        for (const auto& cce : compile_commands_list) {
             auto cmd = std::string{};
             cmd += "  {\n";
             cmd += "    \"command\":\"" + escapeStringJSON(cce.command) + "\""; cmd += ",\n";
@@ -1140,15 +1425,18 @@ private:
         res += "\n]";
 
         std::filesystem::create_directories(out.parent_path());
-        auto cmd = std::string{};
-        cmd += "echo";
-        cmd += " \"" + escapeStringBash(res) + "\"";
-        cmd += " > \"" + out.string() + "\"";
-        auto ret = std::system(cmd.data());
-        if (ret != 0) panic("Failed to dump compile_commands.json to %s\n", out.c_str());
+        writeEntireFile(out, res);
     }
 
     void parseArgs() {
+        // baked options
+        options["compiler"] = Option{.key = "compiler", .description = "Set C++ compiler to use by default"};
+        options["optimize"] = Option{.key = "optimize", .description = "Set optimization level (O* or Fast) (default: compiler default)"};
+        options["cxx-standard"] = Option{.key = "cxx-standard", .description = "Set C++ standard (c++XX) (default: compiler default)"};
+        options["asan"] = Option{.key = "asan", .description = "Enable AddressSanitizer (default: disabled)"};
+        options["debug-info"] = Option{.key = "debug-info", .description = "Generate debug info (default: enabled)"};
+        options["lto"] = Option{.key = "lto", .description = "Enable Link Time Optimization (default: disabled)"};
+
         auto argc = saved_argc;
         auto argv = saved_argv.data();
         for (int i = 1; i < argc; ++i) {
@@ -1193,9 +1481,7 @@ private:
             }
 
             if (arg == "-j" || arg == "--jobs") {
-                if (i + 1 >= argc) {
-                    panic("Expected number of jobs after %s\n", arg.data());
-                }
+                if (i + 1 >= argc) panic("Expected number of jobs after %s\n", arg.data());
                 max_parallel_jobs = std::stoi(argv[++i]);
                 continue;
             }
@@ -1217,6 +1503,29 @@ private:
             // steps to execute sequentially
             requested_steps.push_back(arg);
         }
+
+        auto optimize_opt = option<std::string>("optimize").value_or("default");
+        if (optimize_opt == "default") global_flags.optimize = Optimize::Default;
+        if (optimize_opt == "O0") global_flags.optimize = Optimize::O0;
+        if (optimize_opt == "O1") global_flags.optimize = Optimize::O1;
+        if (optimize_opt == "O2") global_flags.optimize = Optimize::O2;
+        if (optimize_opt == "O3") global_flags.optimize = Optimize::O3;
+        if (optimize_opt == "Fast") global_flags.optimize = Optimize::Fast;
+
+        auto standard_opt = option<std::string>("cxx-standard").value_or("default");
+        if (standard_opt == "default") global_flags.standard = CXXStandard::Default;
+        if (standard_opt == "c++11") global_flags.standard = CXXStandard::CXX11;
+        if (standard_opt == "c++14") global_flags.standard = CXXStandard::CXX14;
+        if (standard_opt == "c++17") global_flags.standard = CXXStandard::CXX17;
+        if (standard_opt == "c++20") global_flags.standard = CXXStandard::CXX20;
+        if (standard_opt == "c++23") global_flags.standard = CXXStandard::CXX23;
+
+        global_lib_exe_flags.asan = option<bool>("asan").value_or(false);
+        global_lib_exe_flags.debug_info = option<bool>("debug-info").value_or(true);
+        global_lib_exe_flags.lto = option<bool>("lto").value_or(false);
+
+        auto compiler_opt = option<std::string>("compiler");
+        if (compiler_opt.has_value()) global_flags.compile_driver = *compiler_opt;
 
         if (max_parallel_jobs <= 0) max_parallel_jobs = std::thread::hardware_concurrency();
         if (requested_steps.empty()) report_help = true;
@@ -1244,10 +1553,10 @@ private:
         options_file.close();
     }
 
-    [[nodiscard]] Hash buildEntireSourceFileHashCached(Flags flags, Path source_file) {
+    [[nodiscard]] Hash buildEntireSourceFileHashCached(ObjOpts obj, Path source_file) {
         // scan deps using compiler on source_file
         auto cmd = std::string{};
-        cmdRenderCompile(&cmd, flags, {source_file}, {}, "{out}");
+        cmdRenderCompileObj(&cmd, obj, {source_file}, {}, "{out}");
         cmd += " -M";
         auto inputs_h = hashString(cmd).combine(hashFile(source_file));
 
@@ -1265,17 +1574,6 @@ private:
             deps_h = deps_h.combine(hashFile(dep));
         }
         return inputs_h.combine(deps_h);
-    }
-
-    void checkIfBuildScriptChanged() {
-        auto new_hash = buildEntireSourceFileHashCached({.compile_driver = BPP_RECOMPILE_SELF_CMD}, root / "build.cpp");
-        // this if helps avoid rebuilding tool if cache is purged completely
-        std::ifstream hash_file{selfHashPath()};
-        if (!hash_file.is_open()) recompileSelf(new_hash, "build tool hash file missing, can't verify self-consistency");
-        Hash old_hash{0};
-        hash_file >> old_hash.value;
-        hash_file.close();
-        if (old_hash.value != new_hash.value) recompileSelf(new_hash, "source hashes differ");
     }
 
     void recompileSelf(Hash new_self_hash, const char* reason) {
@@ -1309,13 +1607,18 @@ private:
     }
 
     void performStepIfNeeded(Step* step) {
-        if (step->completed()) {
+        if (step->threadSafeIsCompleted()) {
             return;
         }
 
         // perform dependencies first
         for (auto* dep : step->deps) {
-            if (!dep->completed()) panic("Dependency %s of step %s is not completed before dependant\n", dep->opts.name.c_str(), step->opts.name.c_str());
+            if (!dep->threadSafeIsCompleted()) panic("Dependency %s of step %s is not completed before dependant\n", dep->opts.name.c_str(), step->opts.name.c_str());
+        }
+
+        // perform dependencies first
+        for (auto dep : step->inputs) {
+            if (dep.step && !dep.step->threadSafeIsCompleted()) panic("Dependency %s of step %s is not completed before dependant\n", dep.step->opts.name.c_str(), step->opts.name.c_str());
         }
 
         // recalc hash
@@ -1341,10 +1644,14 @@ private:
             // check if we already have an artifact with the same hash
             if (std::filesystem::exists(expected_path)) {
                 if (!step->opts.silent) {
-                    blog("%s[step]%s %s%s%s up-to-date at %s!\n", c.gray(), c.reset(), c.yellow(), step->opts.name.c_str(), c.reset(), expected_path.c_str());
+                    if (verbose) blog("%s[step]%s %s%s%s up-to-date!\n", c.gray(), c.reset(), c.yellow(), step->opts.name.c_str(), c.reset());
                 }
-                step->completed() = true;
+                step->markCompleted();
                 return;
+            } else {
+                if (verbose && !step->opts.silent) {
+                    blog("%s[step]%s %s%s%s needs to be performed, cache miss at %s\n", c.gray(), c.reset(), c.yellow(), step->opts.name.c_str(), c.reset(), expected_path.c_str());
+                }
             }
         }
 
@@ -1359,11 +1666,9 @@ private:
                 if (ec) panic("Failed to rename tmp file %s to %s: %s\n", tmp_path.c_str(), expected_path.c_str(), ec.message().c_str());
             }
         }
-        auto end = Clock::now();
-        if (!step->opts.silent) {
-            blog("%s[step]%s %s%s%s completed\n", c.gray(), c.reset(), c.yellow(), step->opts.name.c_str(), c.reset());
-        }
-        step->completed() = true;
+
+        if (!step->opts.silent) blog("%s[step]%s %s%s%s completed\n", c.gray(), c.reset(), c.yellow(), step->opts.name.c_str(), c.reset());
+        step->markCompleted();
     }
 
     // entry may be a file or a directory
@@ -1446,15 +1751,38 @@ private:
     }
 };
 
-void configure(Build* b); // expected signature of build function
+inline CXXFlags detectEnvFlags() {
+    CXXFlags flags{};
+    // detect compiler from environment
+    auto env_cxx = std::getenv("CXX");
+    if (env_cxx) {
+        flags.compile_driver = env_cxx;
+    } else {
+        flags.compile_driver = "g++";
+    }
+
+    // detect CXXFLAGS from environment
+    if (auto env_cxxflags = std::getenv("CXXFLAGS"); env_cxxflags) flags.extra_flags = env_cxxflags;
+
+    return flags;
+}
+
+extern "C" void configure_stable(Build* b) { // NOLINT
+    configure(b);
+}
 
 int main(int argc, char** argv) { // NOLINT
-    Build b{argc, argv};
+    auto env_cache = std::getenv("BPP_CACHE_PREFIX");
+    auto env_prefix = std::getenv("BPP_INSTALL_PREFIX");
+    Build b{argc, argv, Path{argv[0]}.parent_path().c_str(), env_cache, env_prefix, detectEnvFlags()};
+    b.recompileBuildScriptIfChanged();
+    b.preConfigure();
     try {
         configure(&b);
     } catch (const std::exception& e) {
         panic("your build script exited with exception: %s\n", e.what());
     }
+    b.postConfigure();
     try {
         b.runBuild();
     } catch (const std::exception& e) {

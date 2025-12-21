@@ -1,4 +1,4 @@
-#define BPP_RECOMPILE_SELF_CMD "clang++ -g -O0 -w"
+#define BPP_RECOMPILE_SELF_CMD "clang++"
 #include "buildpp.h"
 
 // you can use your functions here
@@ -14,12 +14,9 @@ void configure(Build* b) {
     auto enable_x = b->option<bool>("enable-x", "Enable feature X").value_or(false);
 
     auto gen_includes_path = Path{"generated"} / "include";
-    auto common_flags = Flags{
+    auto common_flags = CXXFlagsOverlay{
         .include_paths = { {.path = b->out / gen_includes_path} }, // here 
         .defines = { {"ENABLE_FEATURE_X", enable_x ? "1" : "0"} },
-        .asan = true,
-        .lto = true,
-        .debug_info = true,
         .warnings = true,
         .optimize = Optimize::O2,
         .standard = CXXStandard::CXX20,
@@ -28,13 +25,12 @@ void configure(Build* b) {
     auto foobar = b->addLib({
         .name = "foobar", 
         .obj = common_flags,
-        // .link = StaticLinkTool{"gcc-ar"}, // static-lib, you must provide your own archiver tool
-        .link = common_flags, // shared-lib, uses compiler to produce .so with flags you provided
+        .static_lib = true,
     }, {
         "src/foo.cpp",
         "src/bar.cpp",
     });
-    b->installLib(foobar, foobar->libName());
+    b->installLib(foobar);
 
     auto main = b->addExe({
         .name = "main",
@@ -45,7 +41,7 @@ void configure(Build* b) {
         "src/main.cpp",
     });
     main->link_step->inputs.push_back({.step = foobar->link_step}); // linking
-    b->installExe(main, "main");
+    b->installExe(main);
 
     auto codegen = b->addStep({
         .name = "codegen",
@@ -64,7 +60,7 @@ void configure(Build* b) {
     foobar->dependLibOn(installed_cg);
 
     // Creates "Step" that will execute artefact of some target with arguments.
-    b->addRun(main, { .name = "run", .desc = "Run the main executable", .args = b->cli_args});
+    b->addRunExe(main, { .name = "run", .desc = "Run the main executable", .args = b->cli_args});
 
     // this will dump compile_commands.json , needed for ides to reason about how your program builds
     b->dump_compile_commands = true;

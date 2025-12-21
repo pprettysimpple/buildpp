@@ -1,4 +1,4 @@
-#define BPP_RECOMPILE_SELF_CMD "clang++ -g -O0 -w"
+#define BPP_RECOMPILE_SELF_CMD "clang++"
 #include "buildpp.h"
 
 void configure(Build* b) {
@@ -6,12 +6,15 @@ void configure(Build* b) {
     
     auto main = b->addExe({
         .name = "main", .desc = "My simple binary artefact",
-        .obj = Flags{
-            .asan = true,
-            .debug_info = true,
+        .obj = {
             .warnings = false,
             .optimize = Optimize::O0
         },
+        .exe_flags = {
+            .asan = true,
+            .debug_info = true,
+            .lto = true,
+        },
     }, {"main.cpp"});
-    b->addRun(main, {.name = "run", .desc = "Run the main executable", .args = b->cli_args});
+    b->addRunExe(main, {.name = "run", .desc = "Run the main executable", .args = b->cli_args});
 }
