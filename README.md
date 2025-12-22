@@ -1,32 +1,38 @@
 ### C++ header-only build tooling
 
-#### Project is in development, things to do: compile_commands.json generation, better help, targets list, build subprojects
+#### Idea
+I believe You must be able to build c++ project using only c++ compiler and no other dependencies.
 
-Many thanks to nob.h and build.zig for inspiration. Without this projects at my hands I would never be able to create this tool.
+#### How does it look to write a build script?
+Link to [how_to](https://github.com/pprettysimpple/buildpp/blob/master/how_to/01_simple/build.cpp) entry
+```cpp
+#define BPP_RECOMPILE_SELF_CMD "clang++"
+#include "buildpp.h"
 
-First idea is that you must be able to build c++ sources using only c++ compiler.
-Second idea comes from first. Write some simple tooling to assist you in creating configuration for your project in c++.
+void configure(Build* b) {
+    auto main = b->addExe({.name = "main", .desc = "My simple executable"}, {"main.cpp"});
+    b->installExe(main);
+    b->addRunExe(main, {.name = "run", .desc = "Run the main executable", .args = b->cli_args});
 
-Process of building with this tool:
-You write your `build.cpp` file. You compile it. Then you call it and it acts like your build tool (cmake, make, ninja).
-If it detects that it's executable is outdated, tool will automatically rebuild itself and you would only notice it by seeing how it slows down for a few seconds.
-
-I've prepared a basic guide on how to get started with it down here:
-
-```bash
-# install compiler that supports c++20. example will use global clang++
-sudo apt install clang # probably, you already have one
-git clone git@github.com:pprettysimpple/buildpp.git
-cd buildpp/example_01_simple
-clang++ build.cpp -o b # bootstrapping
-# after you successfully built yout first example,
-#   check out what's written in build.cpp and try tackle with it for a bit
-# then go on to your next example
-
-# to recompile after any change:
-./b <step-name>
-
-./b build # will launch `build` step
+    auto libmain = b->addLib({.name = "main", .desc = "My simple library"}, {"main.cpp"});
+    b->installLib(libmain);
+}
 ```
 
-You would pick-up pace real easy if you see example folders. Start from first one. No hard stuff here at all.
+#### What does it do?
+You write your `build.cpp` file. You compile it ONCE in the simplest way possible (aka `clang++ -o b build.cpp`). Then you call it and it acts like your build tool (cmake, make, ninja).
+If it detects that it's executable is outdated, tool will automatically rebuild itself and you would only notice it by seeing how it slows down for a few seconds and reports recompilation time.
+
+Here is some bash to get started:
+```bash
+sudo apt install clang # install compiler
+git clone git@github.com:pprettysimpple/buildpp.git
+cd buildpp/how_to/01_simple
+clang++ build.cpp -o b # bootstrap
+./b help
+```
+
+Follow the `how_to` folder examples to get yourself comfortable with writing this scripts
+
+#### Thank you!
+Many thanks to [nob.h](https://github.com/tsoding/nob.h) and build.zig for inspiration. Without this projects at my hands I would never be able to create this tool.
