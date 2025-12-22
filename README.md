@@ -1,4 +1,4 @@
-### C++ header-only build tooling
+### buildpp -- C++ Build system in C++
 
 #### Idea
 I believe You must be able to build c++ project using only c++ compiler and no other dependencies.
